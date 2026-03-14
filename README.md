@@ -49,21 +49,26 @@ src/
   flash_attention_v2.cu   # K2: l/m 进寄存器 + float4 向量化
   flash_attention_v3.cu   # K3: Ss padding 消除 Bank Conflict
 bench/
-  benchmark.py            # ctypes 调用，输出性能表格 + 正确性验证
+  benchmark.cu            # 纯 CUDA C，cudaEvent 计时，输出表格 + results.csv
 Makefile
 ```
 
 ## 编译和运行
 
 ```bash
-make          # 编译所有 kernel 到 build/*.so
-# 或单独编译：
-make k0 k1 k2 k3
+module load cuda/10.2          # 集群加载 CUDA（按实际 module 名调整）
 
-python bench/benchmark.py
+make bench                     # 编译 benchmark 可执行文件
+./build/benchmark              # 运行，结果同时打印到终端并写入 results.csv
+
+# 如果 nvcc 不在 PATH：
+make bench NVCC=/usr/local/cuda-10.2/bin/nvcc ARCH=sm_60
+
+# 也可单独编译各 kernel 的 .so：
+make k0 k1 k2 k3
 ```
 
-要求：CUDA 10.2+，sm_60，d 为 4 的倍数（float4 对齐）。
+要求：CUDA 10.2+，sm_60，d 为 4 的倍数（float4 对齐，默认 d=64）。
 
 ## Online Softmax 原理
 
