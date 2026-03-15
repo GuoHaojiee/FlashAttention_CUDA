@@ -76,55 +76,33 @@ static void compute_stats(const float* t, float* mean, float* sd) {
     *sd = sqrtf(var / REPEAT);
 }
 
-// ── DRAM traffic accounting (per head, in floats → *bh*sizeof(float) for bytes) ──
+// ── DRAM traffic accounting ────────────────────────────────────────────────────
 //
-// K0 — Naive Attention (three separate kernel launches):
-//   compute_S: read Q(N*d) + read K(N*d) + write S(N*N)
-//   softmax  : read S(N*N) + write S(N*N)        [3-pass, L1-cached within row]
-//   compute_O: read S(N*N) + read V(N*d) + write O(N*d)
-//   Total/head = 4*N*d + 4*N*N
+// K0 — Naive Attention (three separate kernel launches, materializes N×N S matrix):
+//   Pass 1 (compute_S): read Q(N*d) + read K(N*d) + write S(N²)  = 2Nd + N²
+//   Pass 2 (softmax)  : read S(N²) + write S(N²)                 = 2N²
+//   Pass 3 (compute_O): read S(N²) + read V(N*d) + write O(N*d)  = N² + 2Nd
+//   Total/head = 4*N² + 4*N*d
+//     ← dominated by the N×N attention matrix
 //
-// K1 — Flash (Br=64, Bc=32, l/m in HBM):
-//   Single fused kernel. Tr=ceil(N/Br) blocks per head, Tc=ceil(N/Bc) kv-tiles.
-//   Per block:
-//     Q tile load          Br*d reads
-//     K/V tile loads       Tc * 2*Bc*d reads          (K,V each reloaded every block)
-//     l/m init             2*Br writes                (before kv loop)
-//     l/m per-tile R/W     Tc * (2*Br reads + 2*Br writes)
-//     l final read         Br reads                   (for O normalization)
-//     O tile write         Br*d writes
-//   Summing Tr blocks (Tr*Br ≈ N):
-//     Q+O  = 2*N*d
-//     K+V  = 2*Tr * N*d
-//     l+m  = N * (3 + 4*Tc)
-//   Total/head = 2*N*d + 2*Tr*N*d + N*(3 + 4*Tc)
-//
-// K2/K3 — Flash (Br=128, Bc=32, l/m in registers):
-//   Same data flow as K1, but l/m never touch HBM.
-//   Total/head = 2*N*d + 2*Tr*N*d  =  (2 + 2*Tr) * N * d
+// K1/K2/K3 — FlashAttention (NO N×N matrix ever touches HBM):
+//   The S tile (Br×Bc) lives entirely in registers/SRAM.
+//   Only Q, K, V, O are read/written to HBM, each exactly once:
+//     read Q(N*d) + read K(N*d) + read V(N*d) + write O(N*d) = 4*N*d
+//   This is the theoretical minimum — independent of Br/Bc/tiling.
+//   N=4096, d=64, bh=8: 4×4096×64×8×4 = 32 MB  (vs K0's ~2 GB)
 
 #define P100_BW_GBs 732.0f
 
-static double dram_k0_bytes(int bh, int N, int d) {
-    double per_head = 4.0 * N * d + 4.0 * N * N;
-    return (double)bh * per_head * sizeof(float);
+static long long dram_k0_bytes(int bh, int N, int d) {
+    return (long long)bh * (4LL*N*N + 4LL*N*d) * (long long)sizeof(float);
 }
-static double dram_k1_bytes(int bh, int N, int d, int br, int bc) {
-    int Tr = (N + br - 1) / br;
-    int Tc = (N + bc - 1) / bc;
-    double qo = 2.0 * N * d;
-    double kv = 2.0 * Tr * N * d;
-    double lm = (double)N * (3 + 4 * Tc);
-    return (double)bh * (qo + kv + lm) * sizeof(float);
+static long long dram_flash_bytes(int bh, int N, int d) {
+    // Q + K + V + O, each read/written exactly once. No N×N matrix.
+    return (long long)bh * 4LL * N * d * (long long)sizeof(float);
 }
-static double dram_k23_bytes(int bh, int N, int d, int br, int bc) {
-    int Tr = (N + br - 1) / br;
-    double qo = 2.0 * N * d;
-    double kv = 2.0 * Tr * N * d;
-    return (double)bh * (qo + kv) * sizeof(float);
-}
-static float bw_from_bytes(float ms, double bytes) {
-    return (float)(bytes / (ms * 1e-3) / 1e9);
+static float bw_from_bytes(float ms, long long bytes) {
+    return (float)((double)bytes / (ms * 1e-3) / 1e9);
 }
 
 struct Result {
@@ -132,7 +110,7 @@ struct Result {
     float mean_ms;
     float sd_ms;
     float bw;
-    float dram_mb;
+    float dram_mb;   // theoretical DRAM traffic in MB
     float err;
 };
 
@@ -163,11 +141,9 @@ static void bench_one_n(int bh, int N, int d, FILE* csv) {
     float t[REPEAT];
     struct Result res[4];
 
-    // DRAM traffic (theoretical, per-kernel derivation)
-    double bytes_k0  = dram_k0_bytes(bh, N, d);
-    double bytes_k1  = dram_k1_bytes(bh, N, d, 64, 32);
-    double bytes_k2  = dram_k23_bytes(bh, N, d, 128, 32);
-    double bytes_k3  = dram_k23_bytes(bh, N, d, 128, 32);
+    // DRAM traffic (theoretical)
+    long long bytes_k0    = dram_k0_bytes(bh, N, d);
+    long long bytes_flash = dram_flash_bytes(bh, N, d);
 
     // K0: reference
     naive_attention(dQ, dK, dV, dS, dO, bh, N, d);
@@ -176,31 +152,31 @@ static void bench_one_n(int bh, int N, int d, FILE* csv) {
     compute_stats(t, &res[0].mean_ms, &res[0].sd_ms);
     res[0].name    = "K0: Naive Attention ";
     res[0].bw      = bw_from_bytes(res[0].mean_ms, bytes_k0);
-    res[0].dram_mb = (float)(bytes_k0 / 1e6);
+    res[0].dram_mb = (float)((double)bytes_k0 / 1e6);
     res[0].err     = 0.0f;
 
     COLLECT_TIMES(t, flash_attention_v1(dQ, dK, dV, dO, dl, dm, bh, N, d));
     cudaMemcpy(hO, dO, nd, cudaMemcpyDeviceToHost);
     compute_stats(t, &res[1].mean_ms, &res[1].sd_ms);
     res[1].name    = "K1: Basic FlashAttn ";
-    res[1].bw      = bw_from_bytes(res[1].mean_ms, bytes_k1);
-    res[1].dram_mb = (float)(bytes_k1 / 1e6);
+    res[1].bw      = bw_from_bytes(res[1].mean_ms, bytes_flash);
+    res[1].dram_mb = (float)((double)bytes_flash / 1e6);
     res[1].err     = max_abs_err(hO, hO_ref, bh * N * d);
 
     COLLECT_TIMES(t, flash_attention_v2(dQ, dK, dV, dO, bh, N, d));
     cudaMemcpy(hO, dO, nd, cudaMemcpyDeviceToHost);
     compute_stats(t, &res[2].mean_ms, &res[2].sd_ms);
     res[2].name    = "K2: +Reg+float4     ";
-    res[2].bw      = bw_from_bytes(res[2].mean_ms, bytes_k2);
-    res[2].dram_mb = (float)(bytes_k2 / 1e6);
+    res[2].bw      = bw_from_bytes(res[2].mean_ms, bytes_flash);
+    res[2].dram_mb = (float)((double)bytes_flash / 1e6);
     res[2].err     = max_abs_err(hO, hO_ref, bh * N * d);
 
     COLLECT_TIMES(t, flash_attention_v3(dQ, dK, dV, dO, bh, N, d));
     cudaMemcpy(hO, dO, nd, cudaMemcpyDeviceToHost);
     compute_stats(t, &res[3].mean_ms, &res[3].sd_ms);
     res[3].name    = "K3: +NoBkConf+CoopLd";
-    res[3].bw      = bw_from_bytes(res[3].mean_ms, bytes_k3);
-    res[3].dram_mb = (float)(bytes_k3 / 1e6);
+    res[3].bw      = bw_from_bytes(res[3].mean_ms, bytes_flash);
+    res[3].dram_mb = (float)((double)bytes_flash / 1e6);
     res[3].err     = max_abs_err(hO, hO_ref, bh * N * d);
 
     // print
