@@ -5,27 +5,28 @@
 #include <float.h>
 
 // d must be a multiple of 4 (float4 alignment)
-#define N      1024
-#define D      64
-#define WARMUP 3
-#define REPEAT 10
+#define SEQ_LEN 1024
+#define HEAD_DIM 64
+#define WARMUP   3
+#define REPEAT   10
 
+// Parameter names omitted to avoid collision with macros
 extern "C" {
     void naive_attention(
-        const float* Q, const float* K, const float* V,
-        float* S, float* O, int N, int d);
+        const float*, const float*, const float*,
+        float*, float*, int, int);
 
     void flash_attention_v1(
-        const float* Q, const float* K, const float* V,
-        float* O, float* l, float* m, int N, int d);
+        const float*, const float*, const float*,
+        float*, float*, float*, int, int);
 
     void flash_attention_v2(
-        const float* Q, const float* K, const float* V,
-        float* O, int N, int d);
+        const float*, const float*, const float*,
+        float*, int, int);
 
     void flash_attention_v3(
-        const float* Q, const float* K, const float* V,
-        float* O, int N, int d);
+        const float*, const float*, const float*,
+        float*, int, int);
 }
 
 // LCG random fill, uniform in [-0.5, 0.5]
@@ -40,8 +41,8 @@ static void rand_fill(float* buf, int n) {
 static float max_abs_err(const float* a, const float* b, int n) {
     float e = 0.0f;
     for (int i = 0; i < n; i++) {
-        float d = fabsf(a[i] - b[i]);
-        if (d > e) e = d;
+        float diff = fabsf(a[i] - b[i]);
+        if (diff > e) e = diff;
     }
     return e;
 }
@@ -65,19 +66,19 @@ static float max_abs_err(const float* a, const float* b, int n) {
     } while (0)
 
 // Naive: Q/K/V read + S written + S read twice (softmax) + S read + V read + O write
-//   ~= (4*N*N + 4*N*D) * sizeof(float)
-// Flash: lower bound = Q+K+V read + O write = 4*N*D*sizeof(float)
-static float bw_naive_GBs(float ms) {
-    long bytes = (4LL * N * N + 4LL * N * D) * sizeof(float);
+//   ~= (4*n*n + 4*n*d) * sizeof(float)
+// Flash: lower bound = Q+K+V read + O write = 4*n*d*sizeof(float)
+static float bw_naive_GBs(float ms, int n, int d) {
+    long bytes = (4LL * n * n + 4LL * n * d) * sizeof(float);
     return (float)bytes / (ms * 1e-3f) / 1e9f;
 }
-static float bw_flash_GBs(float ms) {
-    long bytes = 4LL * N * D * sizeof(float);
+static float bw_flash_GBs(float ms, int n, int d) {
+    long bytes = 4LL * n * d * sizeof(float);
     return (float)bytes / (ms * 1e-3f) / 1e9f;
 }
 
 int main(void) {
-    int n = N, d = D;
+    int n = SEQ_LEN, d = HEAD_DIM;
 
     size_t nd_bytes = (size_t)n * d * sizeof(float);
     float *hQ     = (float*)malloc(nd_bytes);
@@ -103,9 +104,10 @@ int main(void) {
     cudaMemcpy(dK, hK, nd_bytes, cudaMemcpyHostToDevice);
     cudaMemcpy(dV, hV, nd_bytes, cudaMemcpyHostToDevice);
 
-    struct { const char* name; float ms; float bw; float err; } res[4];
+    struct KernelResult { const char* name; float ms; float bw; float err; };
+    struct KernelResult res[4];
 
-    // K0: run once to get reference output, then time
+    // K0: run once to capture reference output, then time
     {
         float ms;
         naive_attention(dQ, dK, dV, dS, dO, n, d);
@@ -113,7 +115,7 @@ int main(void) {
         TIME_KERNEL(ms, naive_attention(dQ, dK, dV, dS, dO, n, d));
         res[0].name = "K0: Naive Attention ";
         res[0].ms   = ms;
-        res[0].bw   = bw_naive_GBs(ms);
+        res[0].bw   = bw_naive_GBs(ms, n, d);
         res[0].err  = 0.0f;
     }
 
@@ -123,7 +125,7 @@ int main(void) {
         cudaMemcpy(hO, dO, nd_bytes, cudaMemcpyDeviceToHost);
         res[1].name = "K1: Basic FlashAttn ";
         res[1].ms   = ms;
-        res[1].bw   = bw_flash_GBs(ms);
+        res[1].bw   = bw_flash_GBs(ms, n, d);
         res[1].err  = max_abs_err(hO, hO_ref, n * d);
     }
 
@@ -133,7 +135,7 @@ int main(void) {
         cudaMemcpy(hO, dO, nd_bytes, cudaMemcpyDeviceToHost);
         res[2].name = "K2: +Reg+float4     ";
         res[2].ms   = ms;
-        res[2].bw   = bw_flash_GBs(ms);
+        res[2].bw   = bw_flash_GBs(ms, n, d);
         res[2].err  = max_abs_err(hO, hO_ref, n * d);
     }
 
@@ -143,7 +145,7 @@ int main(void) {
         cudaMemcpy(hO, dO, nd_bytes, cudaMemcpyDeviceToHost);
         res[3].name = "K3: +No BankConflict";
         res[3].ms   = ms;
-        res[3].bw   = bw_flash_GBs(ms);
+        res[3].bw   = bw_flash_GBs(ms, n, d);
         res[3].err  = max_abs_err(hO, hO_ref, n * d);
     }
 
