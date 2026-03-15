@@ -3,30 +3,33 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-#define HEAD_DIM 64     // d, must be multiple of 4 (float4 alignment)
-#define WARMUP   5      // discarded runs to warm up GPU caches
-#define REPEAT   20     // timed runs; report mean +/- stddev
+// Benchmark config
+// B=1, NH=8 -> bh=8 blocks per Tr tile; P100 has 56 SMs
+// For N=1024, Tr=32: 8*32=256 concurrent blocks -> good SM utilization
+#define BATCH    1
+#define NH       8       // number of attention heads
+#define HEAD_DIM 64      // d, must be multiple of 4
+#define WARMUP   5
+#define REPEAT   20
 
-// N values to sweep
 static const int N_LIST[] = {512, 1024, 2048, 4096};
 static const int N_COUNT  = 4;
 
+// Parameter names omitted to avoid macro collision
 extern "C" {
     void naive_attention(
         const float*, const float*, const float*,
-        float*, float*, int, int);
+        float*, float*, int, int, int);
     void flash_attention_v1(
         const float*, const float*, const float*,
-        float*, float*, float*, int, int);
+        float*, float*, float*, int, int, int);
     void flash_attention_v2(
         const float*, const float*, const float*,
-        float*, int, int);
+        float*, int, int, int);
     void flash_attention_v3(
         const float*, const float*, const float*,
-        float*, int, int);
+        float*, int, int, int);
 }
-
-// ── helpers ────────────────────────────────────────────────────────────────────
 
 static void rand_fill(float* buf, int n) {
     unsigned s = 20250315u;
@@ -45,8 +48,7 @@ static float max_abs_err(const float* a, const float* b, int n) {
     return e;
 }
 
-// Collect REPEAT individual timings (ms) into out[].
-// Each run is bracketed by its own cudaEvent pair for accuracy.
+// Each run gets its own cudaEvent pair for accurate per-iteration timing
 #define COLLECT_TIMES(out, call)                                    \
     do {                                                            \
         for (int _w = 0; _w < WARMUP; _w++) { call; }             \
@@ -65,7 +67,7 @@ static float max_abs_err(const float* a, const float* b, int n) {
         }                                                           \
     } while (0)
 
-static void stats(const float* t, float* mean, float* sd) {
+static void compute_stats(const float* t, float* mean, float* sd) {
     float sum = 0.0f;
     for (int i = 0; i < REPEAT; i++) sum += t[i];
     *mean = sum / REPEAT;
@@ -74,20 +76,17 @@ static void stats(const float* t, float* mean, float* sd) {
     *sd = sqrtf(var / REPEAT);
 }
 
-// Lower-bound DRAM traffic estimates (bytes):
-//   Naive : S is written once and read twice across three kernels,
-//           total ~(4*n^2 + 4*n*d) * sizeof(float)
-//   Flash : ideal minimum = Q+K+V read + O write = 4*n*d*sizeof(float)
-static float bw_naive(float ms, int n, int d) {
-    double bytes = (4.0 * n * n + 4.0 * n * d) * sizeof(float);
+// DRAM traffic lower bounds (bytes across all bh heads):
+//   Naive: S written once + read twice across kernels ~= (4*N*N + 4*N*d) * bh * 4
+//   Flash: ideal minimum = (Q+K+V read + O write) = 4*N*d * bh * 4
+static float bw_naive(float ms, int bh, int N, int d) {
+    double bytes = (double)bh * (4.0 * N * N + 4.0 * N * d) * sizeof(float);
     return (float)(bytes / (ms * 1e-3) / 1e9);
 }
-static float bw_flash(float ms, int n, int d) {
-    double bytes = 4.0 * n * d * sizeof(float);
+static float bw_flash(float ms, int bh, int N, int d) {
+    double bytes = (double)bh * 4.0 * N * d * sizeof(float);
     return (float)(bytes / (ms * 1e-3) / 1e9);
 }
-
-// ── per-N benchmark ────────────────────────────────────────────────────────────
 
 struct Result {
     const char* name;
@@ -97,27 +96,25 @@ struct Result {
     float err;
 };
 
-static void bench_one_n(int n, int d, FILE* csv) {
-    size_t nd  = (size_t)n * d * sizeof(float);
-    size_t nn  = (size_t)n * n * sizeof(float);
+static void bench_one_n(int bh, int N, int d, FILE* csv) {
+    size_t nd  = (size_t)bh * N * d * sizeof(float);
+    size_t nn  = (size_t)bh * N * N * sizeof(float);
 
-    // host buffers
     float *hQ     = (float*)malloc(nd);
     float *hK     = (float*)malloc(nd);
     float *hV     = (float*)malloc(nd);
     float *hO_ref = (float*)malloc(nd);
     float *hO     = (float*)malloc(nd);
-    rand_fill(hQ, n * d);
-    rand_fill(hK, n * d);
-    rand_fill(hV, n * d);
+    rand_fill(hQ, bh * N * d);
+    rand_fill(hK, bh * N * d);
+    rand_fill(hV, bh * N * d);
 
-    // device buffers
     float *dQ, *dK, *dV, *dO, *dS, *dl, *dm;
     cudaMalloc(&dQ, nd); cudaMalloc(&dK, nd); cudaMalloc(&dV, nd);
     cudaMalloc(&dO, nd);
-    cudaMalloc(&dS, nn);   // K0 only
-    cudaMalloc(&dl, n * sizeof(float));  // K1 only
-    cudaMalloc(&dm, n * sizeof(float));  // K1 only
+    cudaMalloc(&dS, nn);
+    cudaMalloc(&dl, (size_t)bh * N * sizeof(float));
+    cudaMalloc(&dm, (size_t)bh * N * sizeof(float));
 
     cudaMemcpy(dQ, hQ, nd, cudaMemcpyHostToDevice);
     cudaMemcpy(dK, hK, nd, cudaMemcpyHostToDevice);
@@ -126,42 +123,40 @@ static void bench_one_n(int n, int d, FILE* csv) {
     float t[REPEAT];
     struct Result res[4];
 
-    // K0 — also captures reference output
-    naive_attention(dQ, dK, dV, dS, dO, n, d);
+    // K0: reference
+    naive_attention(dQ, dK, dV, dS, dO, bh, N, d);
     cudaMemcpy(hO_ref, dO, nd, cudaMemcpyDeviceToHost);
-    COLLECT_TIMES(t, naive_attention(dQ, dK, dV, dS, dO, n, d));
-    stats(t, &res[0].mean_ms, &res[0].sd_ms);
+    COLLECT_TIMES(t, naive_attention(dQ, dK, dV, dS, dO, bh, N, d));
+    compute_stats(t, &res[0].mean_ms, &res[0].sd_ms);
     res[0].name = "K0: Naive Attention ";
-    res[0].bw   = bw_naive(res[0].mean_ms, n, d);
+    res[0].bw   = bw_naive(res[0].mean_ms, bh, N, d);
     res[0].err  = 0.0f;
 
-    // K1
-    COLLECT_TIMES(t, flash_attention_v1(dQ, dK, dV, dO, dl, dm, n, d));
+    COLLECT_TIMES(t, flash_attention_v1(dQ, dK, dV, dO, dl, dm, bh, N, d));
     cudaMemcpy(hO, dO, nd, cudaMemcpyDeviceToHost);
-    stats(t, &res[1].mean_ms, &res[1].sd_ms);
+    compute_stats(t, &res[1].mean_ms, &res[1].sd_ms);
     res[1].name = "K1: Basic FlashAttn ";
-    res[1].bw   = bw_flash(res[1].mean_ms, n, d);
-    res[1].err  = max_abs_err(hO, hO_ref, n * d);
+    res[1].bw   = bw_flash(res[1].mean_ms, bh, N, d);
+    res[1].err  = max_abs_err(hO, hO_ref, bh * N * d);
 
-    // K2
-    COLLECT_TIMES(t, flash_attention_v2(dQ, dK, dV, dO, n, d));
+    COLLECT_TIMES(t, flash_attention_v2(dQ, dK, dV, dO, bh, N, d));
     cudaMemcpy(hO, dO, nd, cudaMemcpyDeviceToHost);
-    stats(t, &res[2].mean_ms, &res[2].sd_ms);
+    compute_stats(t, &res[2].mean_ms, &res[2].sd_ms);
     res[2].name = "K2: +Reg+float4     ";
-    res[2].bw   = bw_flash(res[2].mean_ms, n, d);
-    res[2].err  = max_abs_err(hO, hO_ref, n * d);
+    res[2].bw   = bw_flash(res[2].mean_ms, bh, N, d);
+    res[2].err  = max_abs_err(hO, hO_ref, bh * N * d);
 
-    // K3
-    COLLECT_TIMES(t, flash_attention_v3(dQ, dK, dV, dO, n, d));
+    COLLECT_TIMES(t, flash_attention_v3(dQ, dK, dV, dO, bh, N, d));
     cudaMemcpy(hO, dO, nd, cudaMemcpyDeviceToHost);
-    stats(t, &res[3].mean_ms, &res[3].sd_ms);
+    compute_stats(t, &res[3].mean_ms, &res[3].sd_ms);
     res[3].name = "K3: +No BankConflict";
-    res[3].bw   = bw_flash(res[3].mean_ms, n, d);
-    res[3].err  = max_abs_err(hO, hO_ref, n * d);
+    res[3].bw   = bw_flash(res[3].mean_ms, bh, N, d);
+    res[3].err  = max_abs_err(hO, hO_ref, bh * N * d);
 
     // print
     float base = res[0].mean_ms;
-    printf("N=%-5d  d=%-3d\n", n, d);
+    printf("N=%-5d  d=%-3d  bh=%d  (grid_flash = Tr x bh = %d x %d)\n",
+           N, d, bh, (N + 31) / 32, bh);
     printf("  %-22s  %9s %8s  %14s  %8s  %10s  %5s\n",
            "Kernel", "Mean(ms)", "Std(ms)", "DRAM BW(GB/s)", "Speedup", "MaxAbsErr", "Pass");
     printf("  %.80s\n",
@@ -178,12 +173,11 @@ static void bench_one_n(int n, int d, FILE* csv) {
     }
     printf("\n");
 
-    // csv rows
     for (int i = 0; i < 4; i++) {
         const char* pass = (i == 0) ? "ref"
                          : (res[i].err < 1e-2f ? "YES" : "NO");
-        fprintf(csv, "%d,%d,%s,%.4f,%.4f,%.2f,%.4f,%.2e,%s\n",
-                n, d, res[i].name,
+        fprintf(csv, "%d,%d,%d,%d,%s,%.4f,%.4f,%.2f,%.4f,%.2e,%s\n",
+                BATCH, NH, N, d, res[i].name,
                 res[i].mean_ms, res[i].sd_ms,
                 res[i].bw,
                 base / res[i].mean_ms,
@@ -195,20 +189,21 @@ static void bench_one_n(int n, int d, FILE* csv) {
     free(hQ); free(hK); free(hV); free(hO_ref); free(hO);
 }
 
-// ── main ───────────────────────────────────────────────────────────────────────
-
 int main(void) {
-    int d = HEAD_DIM;
+    int bh = BATCH * NH;
+    int d  = HEAD_DIM;
 
-    printf("\n[FlashAttention Benchmark]  d=%d  warmup=%d  repeat=%d\n\n",
-           d, WARMUP, REPEAT);
+    printf("\n[FlashAttention Benchmark]  batch=%d  heads=%d  bh=%d  d=%d  "
+           "warmup=%d  repeat=%d\n\n",
+           BATCH, NH, bh, d, WARMUP, REPEAT);
 
     FILE* csv = fopen("results.csv", "w");
     if (csv)
-        fprintf(csv, "N,d,Kernel,Mean_ms,Std_ms,DRAM_BW_GBs,Speedup,MaxAbsErr,Pass\n");
+        fprintf(csv, "Batch,NH,N,d,Kernel,Mean_ms,Std_ms,DRAM_BW_GBs,"
+                     "Speedup,MaxAbsErr,Pass\n");
 
     for (int i = 0; i < N_COUNT; i++)
-        bench_one_n(N_LIST[i], d, csv);
+        bench_one_n(bh, N_LIST[i], d, csv);
 
     if (csv) {
         fclose(csv);
