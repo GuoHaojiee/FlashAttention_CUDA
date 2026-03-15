@@ -81,20 +81,14 @@ static void compute_stats(const float* t, float* mean, float* sd) {
 //   compute_S : read Q+K (2*N*d), write S (N*N)           per head
 //   softmax   : read S + write S in-place (2*N*N)          per head
 //   compute_O : read S (N*N) + read V + write O (2*N*d)    per head
-//   Total     : (4*N*N + 4*N*d) * bh * sizeof(float)       [correct, includes bh]
+//   Total     : (4*N*N + 4*N*d) * bh * sizeof(float)
 //
-// Flash (Br=32):
+// Flash:
 //   Each of Tr Q-tile blocks reads the ENTIRE K and V from HBM.
-//   -> K reads = Tr * N * d * bh,  V reads = same
-//   -> Q reads = N * d * bh  (each row loaded once, before the kv loop)
-//   -> O writes = N * d * bh
-//   Total = (2*Tr + 2) * N * d * bh * sizeof(float)   where Tr = ceil(N/32)
-//
-//   Previous formula used 4*N*d (ideal if K/V were read once) -- WRONG.
-//   At Br=32, d=64: (2*Tr+2)*N*d = (N/16)*N = N^2/16... wait:
-//   (2*(N/32)+2)*N*64 = (N/16 + 2)*N*64 ≈ 4*N^2 for large N,
-//   which equals naive's 4*N^2 -- Flash has NO DRAM advantage at Br=32, d=64.
-//   Real savings require Br > 2*d (e.g., Br=256 for d=64).
+//   Total = (2*Tr + 2) * N * d * bh * sizeof(float)   where Tr = ceil(N/Br)
+//   Larger Br → fewer K/V re-reads → less DRAM traffic.
+//   K1: Br=64  → traffic ≈ 2N² (half of naive)
+//   K2/K3: Br=128 → traffic ≈ N² (quarter of naive)
 
 #define P100_BW_GBs 732.0f
 
@@ -102,9 +96,9 @@ static float bw_naive(float ms, int bh, int N, int d) {
     double bytes = (double)bh * (4.0 * N * N + 4.0 * N * d) * sizeof(float);
     return (float)(bytes / (ms * 1e-3) / 1e9);
 }
-static float bw_flash(float ms, int bh, int N, int d) {
+static float bw_flash(float ms, int bh, int N, int d, int br) {
     // K and V are each reloaded Tr times (once per Q-tile block)
-    int Tr = (N + 31) / 32;
+    int Tr = (N + br - 1) / br;
     double bytes = (double)bh * (2.0 * Tr + 2.0) * N * d * sizeof(float);
     return (float)(bytes / (ms * 1e-3) / 1e9);
 }
@@ -157,28 +151,29 @@ static void bench_one_n(int bh, int N, int d, FILE* csv) {
     cudaMemcpy(hO, dO, nd, cudaMemcpyDeviceToHost);
     compute_stats(t, &res[1].mean_ms, &res[1].sd_ms);
     res[1].name = "K1: Basic FlashAttn ";
-    res[1].bw   = bw_flash(res[1].mean_ms, bh, N, d);
+    res[1].bw   = bw_flash(res[1].mean_ms, bh, N, d, 64);
     res[1].err  = max_abs_err(hO, hO_ref, bh * N * d);
 
     COLLECT_TIMES(t, flash_attention_v2(dQ, dK, dV, dO, bh, N, d));
     cudaMemcpy(hO, dO, nd, cudaMemcpyDeviceToHost);
     compute_stats(t, &res[2].mean_ms, &res[2].sd_ms);
     res[2].name = "K2: +Reg+float4     ";
-    res[2].bw   = bw_flash(res[2].mean_ms, bh, N, d);
+    res[2].bw   = bw_flash(res[2].mean_ms, bh, N, d, 128);
     res[2].err  = max_abs_err(hO, hO_ref, bh * N * d);
 
     COLLECT_TIMES(t, flash_attention_v3(dQ, dK, dV, dO, bh, N, d));
     cudaMemcpy(hO, dO, nd, cudaMemcpyDeviceToHost);
     compute_stats(t, &res[3].mean_ms, &res[3].sd_ms);
-    res[3].name = "K3: +No BankConflict";
-    res[3].bw   = bw_flash(res[3].mean_ms, bh, N, d);
+    res[3].name = "K3: +NoBkConf+CoopLd";
+    res[3].bw   = bw_flash(res[3].mean_ms, bh, N, d, 128);
     res[3].err  = max_abs_err(hO, hO_ref, bh * N * d);
 
     // print
     float base = res[0].mean_ms;
-    int Tr = (N + 31) / 32;
-    printf("N=%-5d  d=%-3d  bh=%d  Tr=%d  grid_flash=%dx%d\n",
-           N, d, bh, Tr, Tr, bh);
+    int Tr1 = (N + 63) / 64;
+    int Tr2 = (N + 127) / 128;
+    printf("N=%-5d  d=%-3d  bh=%d  Tr_K1=%d  Tr_K2K3=%d\n",
+           N, d, bh, Tr1, Tr2);
     printf("  %-22s  %9s %7s  %13s %6s  %8s  %10s  %5s\n",
            "Kernel", "Mean(ms)", "Std(ms)", "BW(GB/s)", "Util%", "Speedup", "MaxAbsErr", "Pass");
     printf("  %.84s\n",
