@@ -111,28 +111,40 @@ int main(void) {
         naive_attention(dQ, dK, dV, dS, dO, n, d);
         cudaMemcpy(hO_ref, dO, nd_bytes, cudaMemcpyDeviceToHost);
         TIME_KERNEL(ms, naive_attention(dQ, dK, dV, dS, dO, n, d));
-        res[0] = {"K0: Naive Attention ", ms, bw_naive_GBs(ms), 0.0f};
+        res[0].name = "K0: Naive Attention ";
+        res[0].ms   = ms;
+        res[0].bw   = bw_naive_GBs(ms);
+        res[0].err  = 0.0f;
     }
 
     {
         float ms;
         TIME_KERNEL(ms, flash_attention_v1(dQ, dK, dV, dO, dl, dm, n, d));
         cudaMemcpy(hO, dO, nd_bytes, cudaMemcpyDeviceToHost);
-        res[1] = {"K1: Basic FlashAttn ", ms, bw_flash_GBs(ms), max_abs_err(hO, hO_ref, n * d)};
+        res[1].name = "K1: Basic FlashAttn ";
+        res[1].ms   = ms;
+        res[1].bw   = bw_flash_GBs(ms);
+        res[1].err  = max_abs_err(hO, hO_ref, n * d);
     }
 
     {
         float ms;
         TIME_KERNEL(ms, flash_attention_v2(dQ, dK, dV, dO, n, d));
         cudaMemcpy(hO, dO, nd_bytes, cudaMemcpyDeviceToHost);
-        res[2] = {"K2: +Reg+float4     ", ms, bw_flash_GBs(ms), max_abs_err(hO, hO_ref, n * d)};
+        res[2].name = "K2: +Reg+float4     ";
+        res[2].ms   = ms;
+        res[2].bw   = bw_flash_GBs(ms);
+        res[2].err  = max_abs_err(hO, hO_ref, n * d);
     }
 
     {
         float ms;
         TIME_KERNEL(ms, flash_attention_v3(dQ, dK, dV, dO, n, d));
         cudaMemcpy(hO, dO, nd_bytes, cudaMemcpyDeviceToHost);
-        res[3] = {"K3: +No BankConflict", ms, bw_flash_GBs(ms), max_abs_err(hO, hO_ref, n * d)};
+        res[3].name = "K3: +No BankConflict";
+        res[3].ms   = ms;
+        res[3].bw   = bw_flash_GBs(ms);
+        res[3].err  = max_abs_err(hO, hO_ref, n * d);
     }
 
     float base = res[0].ms;
