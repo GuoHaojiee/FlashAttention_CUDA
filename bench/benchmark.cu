@@ -76,15 +76,36 @@ static void compute_stats(const float* t, float* mean, float* sd) {
     *sd = sqrtf(var / REPEAT);
 }
 
-// DRAM traffic lower bounds (bytes across all bh heads):
-//   Naive: S written once + read twice across kernels ~= (4*N*N + 4*N*d) * bh * 4
-//   Flash: ideal minimum = (Q+K+V read + O write) = 4*N*d * bh * 4
+// ── DRAM traffic accounting ────────────────────────────────────────────────────
+// Naive (3 kernels):
+//   compute_S : read Q+K (2*N*d), write S (N*N)           per head
+//   softmax   : read S + write S in-place (2*N*N)          per head
+//   compute_O : read S (N*N) + read V + write O (2*N*d)    per head
+//   Total     : (4*N*N + 4*N*d) * bh * sizeof(float)       [correct, includes bh]
+//
+// Flash (Br=32):
+//   Each of Tr Q-tile blocks reads the ENTIRE K and V from HBM.
+//   -> K reads = Tr * N * d * bh,  V reads = same
+//   -> Q reads = N * d * bh  (each row loaded once, before the kv loop)
+//   -> O writes = N * d * bh
+//   Total = (2*Tr + 2) * N * d * bh * sizeof(float)   where Tr = ceil(N/32)
+//
+//   Previous formula used 4*N*d (ideal if K/V were read once) -- WRONG.
+//   At Br=32, d=64: (2*Tr+2)*N*d = (N/16)*N = N^2/16... wait:
+//   (2*(N/32)+2)*N*64 = (N/16 + 2)*N*64 ≈ 4*N^2 for large N,
+//   which equals naive's 4*N^2 -- Flash has NO DRAM advantage at Br=32, d=64.
+//   Real savings require Br > 2*d (e.g., Br=256 for d=64).
+
+#define P100_BW_GBs 732.0f
+
 static float bw_naive(float ms, int bh, int N, int d) {
     double bytes = (double)bh * (4.0 * N * N + 4.0 * N * d) * sizeof(float);
     return (float)(bytes / (ms * 1e-3) / 1e9);
 }
 static float bw_flash(float ms, int bh, int N, int d) {
-    double bytes = (double)bh * 4.0 * N * d * sizeof(float);
+    // K and V are each reloaded Tr times (once per Q-tile block)
+    int Tr = (N + 31) / 32;
+    double bytes = (double)bh * (2.0 * Tr + 2.0) * N * d * sizeof(float);
     return (float)(bytes / (ms * 1e-3) / 1e9);
 }
 
@@ -155,19 +176,21 @@ static void bench_one_n(int bh, int N, int d, FILE* csv) {
 
     // print
     float base = res[0].mean_ms;
-    printf("N=%-5d  d=%-3d  bh=%d  (grid_flash = Tr x bh = %d x %d)\n",
-           N, d, bh, (N + 31) / 32, bh);
-    printf("  %-22s  %9s %8s  %14s  %8s  %10s  %5s\n",
-           "Kernel", "Mean(ms)", "Std(ms)", "DRAM BW(GB/s)", "Speedup", "MaxAbsErr", "Pass");
-    printf("  %.80s\n",
-           "--------------------------------------------------------------------------------");
+    int Tr = (N + 31) / 32;
+    printf("N=%-5d  d=%-3d  bh=%d  Tr=%d  grid_flash=%dx%d\n",
+           N, d, bh, Tr, Tr, bh);
+    printf("  %-22s  %9s %7s  %13s %6s  %8s  %10s  %5s\n",
+           "Kernel", "Mean(ms)", "Std(ms)", "BW(GB/s)", "Util%", "Speedup", "MaxAbsErr", "Pass");
+    printf("  %.84s\n",
+           "------------------------------------------------------------------------------------");
     for (int i = 0; i < 4; i++) {
         const char* pass = (i == 0) ? " ref"
                          : (res[i].err < 1e-2f ? " YES" : "  NO");
-        printf("  %-22s  %9.3f %8.3f  %14.1f  %7.2fx  %10.2e  %5s\n",
+        float util = res[i].bw / P100_BW_GBs * 100.0f;
+        printf("  %-22s  %9.3f %7.3f  %13.1f %5.1f%%  %7.2fx  %10.2e  %5s\n",
                res[i].name,
                res[i].mean_ms, res[i].sd_ms,
-               res[i].bw,
+               res[i].bw, util,
                base / res[i].mean_ms,
                res[i].err, pass);
     }
