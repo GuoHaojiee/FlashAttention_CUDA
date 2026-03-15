@@ -76,28 +76,52 @@ static void compute_stats(const float* t, float* mean, float* sd) {
     *sd = sqrtf(var / REPEAT);
 }
 
-// ── DRAM traffic accounting ────────────────────────────────────────────────────
-// Naive (3 kernels):
-//   compute_S : read Q+K (2*N*d), write S (N*N)           per head
-//   softmax   : read S + write S in-place (2*N*N)          per head
-//   compute_O : read S (N*N) + read V + write O (2*N*d)    per head
-//   Total     : (4*N*N + 4*N*d) * bh * sizeof(float)
+// ── DRAM traffic accounting (per head, in floats → *bh*sizeof(float) for bytes) ──
 //
-// Flash:
-//   Each of Tr Q-tile blocks reads the ENTIRE K and V from HBM.
-//   Total = (2*Tr + 2) * N * d * bh * sizeof(float)   where Tr = ceil(N/Br)
-//   Larger Br → fewer K/V re-reads → less DRAM traffic.
-//   K1: Br=64  → traffic ≈ 2N² (half of naive)
-//   K2/K3: Br=128 → traffic ≈ N² (quarter of naive)
+// K0 — Naive Attention (three separate kernel launches):
+//   compute_S: read Q(N*d) + read K(N*d) + write S(N*N)
+//   softmax  : read S(N*N) + write S(N*N)        [3-pass, L1-cached within row]
+//   compute_O: read S(N*N) + read V(N*d) + write O(N*d)
+//   Total/head = 4*N*d + 4*N*N
+//
+// K1 — Flash (Br=64, Bc=32, l/m in HBM):
+//   Single fused kernel. Tr=ceil(N/Br) blocks per head, Tc=ceil(N/Bc) kv-tiles.
+//   Per block:
+//     Q tile load          Br*d reads
+//     K/V tile loads       Tc * 2*Bc*d reads          (K,V each reloaded every block)
+//     l/m init             2*Br writes                (before kv loop)
+//     l/m per-tile R/W     Tc * (2*Br reads + 2*Br writes)
+//     l final read         Br reads                   (for O normalization)
+//     O tile write         Br*d writes
+//   Summing Tr blocks (Tr*Br ≈ N):
+//     Q+O  = 2*N*d
+//     K+V  = 2*Tr * N*d
+//     l+m  = N * (3 + 4*Tc)
+//   Total/head = 2*N*d + 2*Tr*N*d + N*(3 + 4*Tc)
+//
+// K2/K3 — Flash (Br=128, Bc=32, l/m in registers):
+//   Same data flow as K1, but l/m never touch HBM.
+//   Total/head = 2*N*d + 2*Tr*N*d  =  (2 + 2*Tr) * N * d
 
 #define P100_BW_GBs 732.0f
 
-static double dram_naive_bytes(int bh, int N, int d) {
-    return (double)bh * (4.0 * N * N + 4.0 * N * d) * sizeof(float);
+static double dram_k0_bytes(int bh, int N, int d) {
+    double per_head = 4.0 * N * d + 4.0 * N * N;
+    return (double)bh * per_head * sizeof(float);
 }
-static double dram_flash_bytes(int bh, int N, int d, int br) {
+static double dram_k1_bytes(int bh, int N, int d, int br, int bc) {
     int Tr = (N + br - 1) / br;
-    return (double)bh * (2.0 * Tr + 2.0) * N * d * sizeof(float);
+    int Tc = (N + bc - 1) / bc;
+    double qo = 2.0 * N * d;
+    double kv = 2.0 * Tr * N * d;
+    double lm = (double)N * (3 + 4 * Tc);
+    return (double)bh * (qo + kv + lm) * sizeof(float);
+}
+static double dram_k23_bytes(int bh, int N, int d, int br, int bc) {
+    int Tr = (N + br - 1) / br;
+    double qo = 2.0 * N * d;
+    double kv = 2.0 * Tr * N * d;
+    return (double)bh * (qo + kv) * sizeof(float);
 }
 static float bw_from_bytes(float ms, double bytes) {
     return (float)(bytes / (ms * 1e-3) / 1e9);
@@ -139,10 +163,11 @@ static void bench_one_n(int bh, int N, int d, FILE* csv) {
     float t[REPEAT];
     struct Result res[4];
 
-    // DRAM traffic (theoretical, in bytes)
-    double bytes_naive = dram_naive_bytes(bh, N, d);
-    double bytes_k1    = dram_flash_bytes(bh, N, d, 64);
-    double bytes_k23   = dram_flash_bytes(bh, N, d, 128);
+    // DRAM traffic (theoretical, per-kernel derivation)
+    double bytes_k0  = dram_k0_bytes(bh, N, d);
+    double bytes_k1  = dram_k1_bytes(bh, N, d, 64, 32);
+    double bytes_k2  = dram_k23_bytes(bh, N, d, 128, 32);
+    double bytes_k3  = dram_k23_bytes(bh, N, d, 128, 32);
 
     // K0: reference
     naive_attention(dQ, dK, dV, dS, dO, bh, N, d);
@@ -150,8 +175,8 @@ static void bench_one_n(int bh, int N, int d, FILE* csv) {
     COLLECT_TIMES(t, naive_attention(dQ, dK, dV, dS, dO, bh, N, d));
     compute_stats(t, &res[0].mean_ms, &res[0].sd_ms);
     res[0].name    = "K0: Naive Attention ";
-    res[0].bw      = bw_from_bytes(res[0].mean_ms, bytes_naive);
-    res[0].dram_mb = (float)(bytes_naive / 1e6);
+    res[0].bw      = bw_from_bytes(res[0].mean_ms, bytes_k0);
+    res[0].dram_mb = (float)(bytes_k0 / 1e6);
     res[0].err     = 0.0f;
 
     COLLECT_TIMES(t, flash_attention_v1(dQ, dK, dV, dO, dl, dm, bh, N, d));
@@ -166,16 +191,16 @@ static void bench_one_n(int bh, int N, int d, FILE* csv) {
     cudaMemcpy(hO, dO, nd, cudaMemcpyDeviceToHost);
     compute_stats(t, &res[2].mean_ms, &res[2].sd_ms);
     res[2].name    = "K2: +Reg+float4     ";
-    res[2].bw      = bw_from_bytes(res[2].mean_ms, bytes_k23);
-    res[2].dram_mb = (float)(bytes_k23 / 1e6);
+    res[2].bw      = bw_from_bytes(res[2].mean_ms, bytes_k2);
+    res[2].dram_mb = (float)(bytes_k2 / 1e6);
     res[2].err     = max_abs_err(hO, hO_ref, bh * N * d);
 
     COLLECT_TIMES(t, flash_attention_v3(dQ, dK, dV, dO, bh, N, d));
     cudaMemcpy(hO, dO, nd, cudaMemcpyDeviceToHost);
     compute_stats(t, &res[3].mean_ms, &res[3].sd_ms);
     res[3].name    = "K3: +NoBkConf+CoopLd";
-    res[3].bw      = bw_from_bytes(res[3].mean_ms, bytes_k23);
-    res[3].dram_mb = (float)(bytes_k23 / 1e6);
+    res[3].bw      = bw_from_bytes(res[3].mean_ms, bytes_k3);
+    res[3].dram_mb = (float)(bytes_k3 / 1e6);
     res[3].err     = max_abs_err(hO, hO_ref, bh * N * d);
 
     // print
