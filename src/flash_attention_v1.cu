@@ -6,10 +6,13 @@
 
 // K1: Basic FlashAttention — Tiling + Online Softmax
 //
-// Key design vs flash-attention-minimal (Br=32):
-//   - Br=64 (> d=64) so that Tr = N/64, halving K/V re-reads from HBM
-//     (at Br=32, d=64, total DRAM ≈ 4N² = same as naive → no benefit)
+// Key fixes vs flash-attention-minimal (Br=32):
+//   - Br=64 (> d=64) so Tr = N/64, halving K/V re-reads from HBM
+//     (at Br=32, d=64, DRAM ≈ 4N² = same as naive → zero benefit)
 //   - Ss in registers: each thread only reads its own scores, no sharing needed
+//   - Qs padded to stride 65: eliminates 32-way bank conflict
+//     (Qs[Br][64] has bank = (tid*64+i)%32 = i%32 → all threads same bank)
+//     (Qs[Br][65] has bank = (tid*65+i)%32 = (tid+i)%32 → all different)
 //
 // What's NOT optimized here (saved for K2):
 //   - Qs still in shared memory (could be registers since each thread owns one row)
@@ -41,8 +44,9 @@ __global__ void flash_attention_v1_kernel(
     int q_row = q_tile * Br + tid;
 
     // Qs in shared memory: basic approach (K2 moves it to registers)
+    // Qs padded to stride 65: bank = (tid*65+i)%32 = (tid+i)%32 → conflict-free
     // Ss NOT in shared memory: each thread only reads its own row → registers
-    __shared__ float Qs[Br][64];
+    __shared__ float Qs[Br][64 + 1];
     __shared__ float Ks[Bc][64];
     __shared__ float Vs[Bc][64];
 

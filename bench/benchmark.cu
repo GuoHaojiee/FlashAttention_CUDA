@@ -92,14 +92,14 @@ static void compute_stats(const float* t, float* mean, float* sd) {
 
 #define P100_BW_GBs 732.0f
 
-static float bw_naive(float ms, int bh, int N, int d) {
-    double bytes = (double)bh * (4.0 * N * N + 4.0 * N * d) * sizeof(float);
-    return (float)(bytes / (ms * 1e-3) / 1e9);
+static double dram_naive_bytes(int bh, int N, int d) {
+    return (double)bh * (4.0 * N * N + 4.0 * N * d) * sizeof(float);
 }
-static float bw_flash(float ms, int bh, int N, int d, int br) {
-    // K and V are each reloaded Tr times (once per Q-tile block)
+static double dram_flash_bytes(int bh, int N, int d, int br) {
     int Tr = (N + br - 1) / br;
-    double bytes = (double)bh * (2.0 * Tr + 2.0) * N * d * sizeof(float);
+    return (double)bh * (2.0 * Tr + 2.0) * N * d * sizeof(float);
+}
+static float bw_from_bytes(float ms, double bytes) {
     return (float)(bytes / (ms * 1e-3) / 1e9);
 }
 
@@ -108,6 +108,7 @@ struct Result {
     float mean_ms;
     float sd_ms;
     float bw;
+    float dram_mb;
     float err;
 };
 
@@ -138,53 +139,61 @@ static void bench_one_n(int bh, int N, int d, FILE* csv) {
     float t[REPEAT];
     struct Result res[4];
 
+    // DRAM traffic (theoretical, in bytes)
+    double bytes_naive = dram_naive_bytes(bh, N, d);
+    double bytes_k1    = dram_flash_bytes(bh, N, d, 64);
+    double bytes_k23   = dram_flash_bytes(bh, N, d, 128);
+
     // K0: reference
     naive_attention(dQ, dK, dV, dS, dO, bh, N, d);
     cudaMemcpy(hO_ref, dO, nd, cudaMemcpyDeviceToHost);
     COLLECT_TIMES(t, naive_attention(dQ, dK, dV, dS, dO, bh, N, d));
     compute_stats(t, &res[0].mean_ms, &res[0].sd_ms);
-    res[0].name = "K0: Naive Attention ";
-    res[0].bw   = bw_naive(res[0].mean_ms, bh, N, d);
-    res[0].err  = 0.0f;
+    res[0].name    = "K0: Naive Attention ";
+    res[0].bw      = bw_from_bytes(res[0].mean_ms, bytes_naive);
+    res[0].dram_mb = (float)(bytes_naive / 1e6);
+    res[0].err     = 0.0f;
 
     COLLECT_TIMES(t, flash_attention_v1(dQ, dK, dV, dO, dl, dm, bh, N, d));
     cudaMemcpy(hO, dO, nd, cudaMemcpyDeviceToHost);
     compute_stats(t, &res[1].mean_ms, &res[1].sd_ms);
-    res[1].name = "K1: Basic FlashAttn ";
-    res[1].bw   = bw_flash(res[1].mean_ms, bh, N, d, 64);
-    res[1].err  = max_abs_err(hO, hO_ref, bh * N * d);
+    res[1].name    = "K1: Basic FlashAttn ";
+    res[1].bw      = bw_from_bytes(res[1].mean_ms, bytes_k1);
+    res[1].dram_mb = (float)(bytes_k1 / 1e6);
+    res[1].err     = max_abs_err(hO, hO_ref, bh * N * d);
 
     COLLECT_TIMES(t, flash_attention_v2(dQ, dK, dV, dO, bh, N, d));
     cudaMemcpy(hO, dO, nd, cudaMemcpyDeviceToHost);
     compute_stats(t, &res[2].mean_ms, &res[2].sd_ms);
-    res[2].name = "K2: +Reg+float4     ";
-    res[2].bw   = bw_flash(res[2].mean_ms, bh, N, d, 128);
-    res[2].err  = max_abs_err(hO, hO_ref, bh * N * d);
+    res[2].name    = "K2: +Reg+float4     ";
+    res[2].bw      = bw_from_bytes(res[2].mean_ms, bytes_k23);
+    res[2].dram_mb = (float)(bytes_k23 / 1e6);
+    res[2].err     = max_abs_err(hO, hO_ref, bh * N * d);
 
     COLLECT_TIMES(t, flash_attention_v3(dQ, dK, dV, dO, bh, N, d));
     cudaMemcpy(hO, dO, nd, cudaMemcpyDeviceToHost);
     compute_stats(t, &res[3].mean_ms, &res[3].sd_ms);
-    res[3].name = "K3: +NoBkConf+CoopLd";
-    res[3].bw   = bw_flash(res[3].mean_ms, bh, N, d, 128);
-    res[3].err  = max_abs_err(hO, hO_ref, bh * N * d);
+    res[3].name    = "K3: +NoBkConf+CoopLd";
+    res[3].bw      = bw_from_bytes(res[3].mean_ms, bytes_k23);
+    res[3].dram_mb = (float)(bytes_k23 / 1e6);
+    res[3].err     = max_abs_err(hO, hO_ref, bh * N * d);
 
     // print
     float base = res[0].mean_ms;
-    int Tr1 = (N + 63) / 64;
-    int Tr2 = (N + 127) / 128;
-    printf("N=%-5d  d=%-3d  bh=%d  Tr_K1=%d  Tr_K2K3=%d\n",
-           N, d, bh, Tr1, Tr2);
-    printf("  %-22s  %9s %7s  %13s %6s  %8s  %10s  %5s\n",
-           "Kernel", "Mean(ms)", "Std(ms)", "BW(GB/s)", "Util%", "Speedup", "MaxAbsErr", "Pass");
-    printf("  %.84s\n",
-           "------------------------------------------------------------------------------------");
+    printf("N=%-5d  d=%-3d  bh=%d  Br: K1=64 K2,K3=128\n", N, d, bh);
+    printf("  %-22s  %9s %7s  %9s  %9s %6s  %8s  %10s  %5s\n",
+           "Kernel", "Mean(ms)", "Std(ms)",
+           "DRAM(MB)", "BW(GB/s)", "Util%", "Speedup", "MaxAbsErr", "Pass");
+    printf("  %.104s\n",
+           "--------------------------------------------------------------------------------------------------------");
     for (int i = 0; i < 4; i++) {
         const char* pass = (i == 0) ? " ref"
                          : (res[i].err < 1e-2f ? " YES" : "  NO");
         float util = res[i].bw / P100_BW_GBs * 100.0f;
-        printf("  %-22s  %9.3f %7.3f  %13.1f %5.1f%%  %7.2fx  %10.2e  %5s\n",
+        printf("  %-22s  %9.3f %7.3f  %9.1f  %9.1f %5.1f%%  %7.2fx  %10.2e  %5s\n",
                res[i].name,
                res[i].mean_ms, res[i].sd_ms,
+               res[i].dram_mb,
                res[i].bw, util,
                base / res[i].mean_ms,
                res[i].err, pass);
@@ -194,10 +203,10 @@ static void bench_one_n(int bh, int N, int d, FILE* csv) {
     for (int i = 0; i < 4; i++) {
         const char* pass = (i == 0) ? "ref"
                          : (res[i].err < 1e-2f ? "YES" : "NO");
-        fprintf(csv, "%d,%d,%d,%d,%s,%.4f,%.4f,%.2f,%.4f,%.2e,%s\n",
+        fprintf(csv, "%d,%d,%d,%d,%s,%.4f,%.4f,%.1f,%.2f,%.4f,%.2e,%s\n",
                 BATCH, NH, N, d, res[i].name,
                 res[i].mean_ms, res[i].sd_ms,
-                res[i].bw,
+                res[i].dram_mb, res[i].bw,
                 base / res[i].mean_ms,
                 res[i].err, pass);
     }
@@ -217,8 +226,8 @@ int main(void) {
 
     FILE* csv = fopen("results.csv", "w");
     if (csv)
-        fprintf(csv, "Batch,NH,N,d,Kernel,Mean_ms,Std_ms,DRAM_BW_GBs,"
-                     "Speedup,MaxAbsErr,Pass\n");
+        fprintf(csv, "Batch,NH,N,d,Kernel,Mean_ms,Std_ms,DRAM_MB,"
+                     "DRAM_BW_GBs,Speedup,MaxAbsErr,Pass\n");
 
     for (int i = 0; i < N_COUNT; i++)
         bench_one_n(bh, N_LIST[i], d, csv);
