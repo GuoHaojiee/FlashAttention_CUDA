@@ -6,7 +6,6 @@
 
 // Q, K, V, O: [bh, N, d]   l, m: [bh, N]
 // grid = (Tr, bh): blockIdx.x = Q tile, blockIdx.y = head index
-// 每个 block 处理一个 head 的一个 Q tile，bh 个 head 完全并行
 
 __global__ void flash_attention_v1_kernel(
     const float* Q, const float* K, const float* V,
@@ -19,7 +18,6 @@ __global__ void flash_attention_v1_kernel(
     int Tr = (N + Br - 1) / Br;
     if (bh_idx >= bh || q_tile >= Tr) return;
 
-    // 当前 head 在全局数组中的偏移
     const float* Qh = Q + (size_t)bh_idx * N * d;
     const float* Kh = K + (size_t)bh_idx * N * d;
     const float* Vh = V + (size_t)bh_idx * N * d;
@@ -35,6 +33,7 @@ __global__ void flash_attention_v1_kernel(
     __shared__ float Vs[Bc][64];
     __shared__ float Ss[Br][Bc];
 
+    // Oi lives entirely in registers: no HBM access inside the kv_tile loop
     float Oi[64] = {0.0f};
     float scale  = 1.0f / sqrtf((float)d);
 
@@ -44,7 +43,7 @@ __global__ void flash_attention_v1_kernel(
         for (int i = 0; i < d; i++) Qs[tid][i] = 0.0f;
     }
 
-    // l/m 初始化写入 HBM（K1 特征：每次 kv_tile 都读写 HBM 中的 l/m）
+    // K1: l/m live in HBM and are read/written once per kv_tile (vs K2 where they stay in registers)
     if (q_row < N) { lh[q_row] = 0.0f; mh[q_row] = -1e9f; }
 
     for (int kv_tile = 0; kv_tile < Tc; kv_tile++) {
@@ -67,27 +66,36 @@ __global__ void flash_attention_v1_kernel(
         }
         __syncthreads();
 
-        // 从 HBM 读取 m 和 l（与 K2 的对比点）
+        // K1: read l/m from HBM each kv_tile
         float mi = (q_row < N) ? mh[q_row] : -1e9f;
         float li = (q_row < N) ? lh[q_row] : 0.0f;
 
         float mj = mi;
         for (int j = 0; j < Bc; j++) mj = fmaxf(mj, Ss[tid][j]);
 
+        // Precompute exp once per j -- previously expf was called (d+1) times per j,
+        // totaling (d+1)*Bc = 65*32 = 2080 expf/kv_tile. Now it's Bc = 32.
+        float exp_s[Bc];
+        for (int j = 0; j < Bc; j++) exp_s[j] = expf(Ss[tid][j] - mj);
+
         float lj = 0.0f;
-        for (int j = 0; j < Bc; j++) lj += expf(Ss[tid][j] - mj);
+        for (int j = 0; j < Bc; j++) lj += exp_s[j];
 
         float alpha  = expf(mi - mj);
         float li_new = li * alpha + lj;
 
-        for (int i = 0; i < d; i++) {
-            float vi_sum = 0.0f;
-            for (int j = 0; j < Bc; j++) vi_sum += expf(Ss[tid][j] - mj) * Vs[j][i];
-            Oi[i] = Oi[i] * alpha + vi_sum;
+        // Rescale accumulated O, then add this tile's contribution.
+        // j-outer loop: accesses Vs[j][0..d-1] sequentially (good smem locality).
+        // Previously i-outer accessed Vs with stride d between j steps.
+        for (int i = 0; i < d; i++) Oi[i] *= alpha;
+        for (int j = 0; j < Bc; j++) {
+            float esj = exp_s[j];
+            for (int i = 0; i < d; i++) Oi[i] += esj * Vs[j][i];
         }
 
-        // 将更新后的 m/l 写回 HBM
+        // K1: write l/m back to HBM each kv_tile
         if (q_row < N) { mh[q_row] = mj; lh[q_row] = li_new; }
+        mi = mj; li = li_new;
         __syncthreads();
     }
 

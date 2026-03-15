@@ -4,8 +4,10 @@
 #define Br 32
 #define Bc 32
 
-// 优化1: l/m 完全在寄存器，不再每次 kv_tile 读写 HBM
-// 优化2: float4 向量化加载 Q/K/V（要求 d % 4 == 0）
+// Optimization over K1:
+//   1. l/m stay in registers for the entire kv loop (no HBM round-trips)
+//   2. float4 vectorized loads for Q/K/V (requires d % 4 == 0)
+//   3. exp_s precomputation (same fix as K1)
 // grid = (Tr, bh)
 
 __global__ void flash_attention_v2_kernel(
@@ -27,7 +29,7 @@ __global__ void flash_attention_v2_kernel(
     int tid   = threadIdx.x;
     int q_row = q_tile * Br + tid;
 
-    // l/m 在寄存器中，全程不触碰 HBM
+    // l/m in registers: never touch HBM inside the kv loop
     float mi = -1e9f;
     float li = 0.0f;
 
@@ -40,7 +42,7 @@ __global__ void flash_attention_v2_kernel(
     float scale  = 1.0f / sqrtf((float)d);
     int d4 = d / 4;
 
-    // float4 向量化加载 Q tile
+    // float4 vectorized load of Q tile
     if (q_row < N) {
         const float4* Q4 = reinterpret_cast<const float4*>(Qh + q_row * d);
         float4* Qs4 = reinterpret_cast<float4*>(Qs[tid]);
@@ -52,6 +54,7 @@ __global__ void flash_attention_v2_kernel(
     for (int kv_tile = 0; kv_tile < Tc; kv_tile++) {
         int kv_row = kv_tile * Bc + tid;
 
+        // float4 vectorized load of K, V tiles
         if (kv_row < N) {
             const float4* K4 = reinterpret_cast<const float4*>(Kh + kv_row * d);
             const float4* V4 = reinterpret_cast<const float4*>(Vh + kv_row * d);
@@ -73,16 +76,19 @@ __global__ void flash_attention_v2_kernel(
         float mj = mi;
         for (int j = 0; j < Bc; j++) mj = fmaxf(mj, Ss[tid][j]);
 
+        float exp_s[Bc];
+        for (int j = 0; j < Bc; j++) exp_s[j] = expf(Ss[tid][j] - mj);
+
         float lj = 0.0f;
-        for (int j = 0; j < Bc; j++) lj += expf(Ss[tid][j] - mj);
+        for (int j = 0; j < Bc; j++) lj += exp_s[j];
 
         float alpha  = expf(mi - mj);
         float li_new = li * alpha + lj;
 
-        for (int i = 0; i < d; i++) {
-            float vi_sum = 0.0f;
-            for (int j = 0; j < Bc; j++) vi_sum += expf(Ss[tid][j] - mj) * Vs[j][i];
-            Oi[i] = Oi[i] * alpha + vi_sum;
+        for (int i = 0; i < d; i++) Oi[i] *= alpha;
+        for (int j = 0; j < Bc; j++) {
+            float esj = exp_s[j];
+            for (int i = 0; i < d; i++) Oi[i] += esj * Vs[j][i];
         }
 
         mi = mj;
