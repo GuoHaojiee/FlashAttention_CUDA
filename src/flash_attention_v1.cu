@@ -2,7 +2,7 @@
 #include <math.h>
 
 #define Br 64
-#define Bc 32
+#define Bc 16
 
 // K1: Basic FlashAttention — Tiling + Online Softmax
 //
@@ -11,23 +11,23 @@
 //   - Online softmax: running max/sum in registers, single pass over K/V tiles
 //   - Qi in registers: each thread owns one Q row → no shared memory for Q
 //   - l/m in registers: no HBM round-trips inside the kv loop
+//   - Bc=16: reduces ss[] from 32 to 16 registers, allowing more blocks/SM
 //
 // What's NOT optimized here (saved for K2+):
 //   - No float4 vectorized loads
 //   - K/V loading: only first Bc threads load (no cooperative loading)
-//   - No bank-conflict padding on Ks/Vs
 //
 // Occupancy analysis (P100, sm_60):
-//   Registers: Qi[64]+Oi[64]+ss[32]+misc ≈ 170/thread
-//   Shared: Ks[32][64]+Vs[32][64] = 16KB
-//   __launch_bounds__(64,3) → compiler targets ≤170 regs
-//   65536/(170×64) = 6 blocks (regs), 48KB/16KB = 3 blocks (shared) → 3 blocks/SM
-//   3×64 = 192 threads/SM = 6 warps = 9.4% occupancy
+//   Registers: Qi[64]+Oi[64]+ss[16]+misc ≈ 154/thread
+//   Shared: Ks[16][64]+Vs[16][64] = 8KB
+//   __launch_bounds__(64,6) → compiler targets ≤170 regs
+//   65536/(154×64) = 6.6 → 6 blocks (regs), 48KB/8KB = 6 blocks (shared) → 6 blocks/SM
+//   6×64 = 384 threads/SM = 12 warps = 18.75% occupancy
 //
 // grid = (Tr, bh): blockIdx.x = Q tile, blockIdx.y = head
-// blockDim = Br = 64 threads; first Bc=32 threads load K/V tiles
+// blockDim = Br = 64 threads; first Bc=16 threads load K/V tiles
 
-__global__ __launch_bounds__(64, 3)
+__global__ __launch_bounds__(64, 6)
 void flash_attention_v1_kernel(
     const float* Q, const float* K, const float* V,
     float* O,
@@ -57,8 +57,11 @@ void flash_attention_v1_kernel(
 
     // Q in registers: each thread owns one row, no sharing needed
     float Qi[64];
-    float Oi[64] = {0.0f};
+    float Oi[64];
     float scale  = 1.0f / sqrtf((float)d);
+
+    // Zero-init Oi
+    for (int i = 0; i < d; i++) Oi[i] = 0.0f;
 
     // Load Q row into registers
     if (q_row < N) {

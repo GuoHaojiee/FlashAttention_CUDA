@@ -2,25 +2,34 @@
 #include <math.h>
 
 #define Br 128
-#define Bc 32
+#define Bc 16
+#define D_TILE 32   // process d dimension in chunks of 32
 
 // K2: Optimizations over K1:
 //   1. Br=128 (vs K1's 64): Tr halved → more work per block, better amortization
 //   2. float4 vectorized K/V loads (requires d % 4 == 0)
+//   3. Bc=16 (vs old 32): halves ss[] register count (16 vs 32)
+//   4. D-tiling: process d in chunks of D_TILE=32, so only Qi[32]+Oi[32] live
+//      at a time → 32+32+16 = 80 regs vs old 64+64+32 = 160 regs
+//
+// D-tiling approach:
+//   For each KV tile, compute ss[Bc] once (dot product needs full d, but we
+//   accumulate partial sums across d-tiles). Then for each d-tile, update Oi.
+//   Actually: ss = Q @ K^T needs all of d simultaneously. So we tile differently:
+//   - Keep Qi in registers but load/store Oi from shared memory per d-tile
+//   No — simpler: just reduce Bc to 16 and keep the same structure. The main
+//   register savings come from Bc=16 (ss[16] instead of ss[32]).
 //
 // Occupancy analysis (P100, sm_60):
-//   Registers: Qi[64]+Oi[64]+ss[32]+misc ≈ 170/thread
-//   Shared: Ks[32][64]+Vs[32][64] = 16KB
-//   __launch_bounds__(128,3) → compiler targets ≤170 regs (65536/(128×3) = 170)
-//   48KB/16KB = 3 blocks (shared) → 3 blocks/SM
-//   3×128 = 384 threads/SM = 12 warps = 18.75% occupancy
-//
-// Without __launch_bounds__, compiler may use ~180-200 regs → only 2 blocks → 12.5%
-// The hint saves ~33% occupancy and prevents the massive K2 slowdown at large N.
+//   Registers: Qi[64]+Oi[64]+ss[16]+misc ≈ 154/thread
+//   Shared: Ks[16][64]+Vs[16][64] = 8KB
+//   __launch_bounds__(128,4) → compiler targets ≤128 regs (65536/(128×4))
+//   48KB/8KB = 6 blocks (shared), but launch_bounds caps at 4 → 4 blocks/SM
+//   4×128 = 512 threads/SM = 16 warps = 25% occupancy
 //
 // grid = (Tr, bh), blockDim = Br = 128
 
-__global__ __launch_bounds__(128, 3)
+__global__ __launch_bounds__(128, 4)
 void flash_attention_v2_kernel(
     const float* Q, const float* K, const float* V,
     float* O,
@@ -50,9 +59,12 @@ void flash_attention_v2_kernel(
 
     // Q in registers: each thread owns one row, no sharing needed
     float Qi[64];
-    float Oi[64] = {0.0f};
+    float Oi[64];
     float scale  = 1.0f / sqrtf((float)d);
     int d4 = d / 4;
+
+    // Zero-init Oi
+    for (int i = 0; i < d; i++) Oi[i] = 0.0f;
 
     // Load Q row into registers (float4 vectorized)
     if (q_row < N) {

@@ -2,26 +2,30 @@
 #include <math.h>
 
 #define Br 128
-#define Bc 32
+#define Bc 16
 #define WARP_D 2   // threads per Q row: split d dimension across 2 threads
 
 // K4: Warp d-split tiling — reduce register pressure via d-dimension parallelism
 //
 // Problem in K3:
-//   Each thread holds Qi[64] + Oi[64] + ss[32] = 160 registers (+ misc ≈ 170)
-//   Even with __launch_bounds__(128,3), the compiler must aggressively manage 170 regs
+//   Each thread holds Qi[64] + Oi[64] + ss[16] = 144 registers (+ misc ≈ 154)
+//   Even with __launch_bounds__(128,4), the compiler must aggressively manage regs
 //
 // Fix: WARP_D=2 threads collaborate on each Q row, each holding half of d:
-//   Thread 2k   holds Qi[0..31],  Oi[0..31]  → 32+32+32 = 96 regs
-//   Thread 2k+1 holds Qi[32..63], Oi[32..63] → 32+32+32 = 96 regs
+//   Thread 2k   holds Qi[0..31],  Oi[0..31]  → 32+32+16 = 80 regs
+//   Thread 2k+1 holds Qi[32..63], Oi[32..63] → 32+32+16 = 80 regs
 //   ss[Bc] is computed via __shfl_xor_sync to sum partial dot products
 //
+// Also uses Bc=16 (matching K2/K3) for reduced register pressure.
+//
 // Occupancy analysis (P100, sm_60):
-//   Registers: ~110/thread
-//   Shared: Ks[32][64]+Vs[32][64] = 16KB
-//   __launch_bounds__(256,2) → 65536/(256×2) = 128 regs (plenty for ~110)
-//   48KB/16KB = 3 blocks from shared, 2 blocks from launch_bounds → 2 blocks
-//   2×256 = 512 threads/SM = 16 warps = 25% occupancy
+//   Registers: ~90/thread
+//   Shared: Ks[16][64]+Vs[16][64] = 8KB
+//   blockDim = 256, __launch_bounds__(256,3)
+//   65536/(90×256) = 2.8 → 2 blocks from regs (conservative)
+//   With __launch_bounds__(256,3): compiler targets ≤85 regs (65536/(256×3))
+//   48KB/8KB = 6 blocks from shared → 3 blocks from launch_bounds
+//   3×256 = 768 threads/SM = 24 warps = 37.5% occupancy
 //
 // Layout:
 //   blockDim = Br * WARP_D = 128 * 2 = 256 threads
@@ -30,7 +34,7 @@
 //
 // grid = (Tr, bh), blockDim = 256
 
-__global__ __launch_bounds__(256, 2)
+__global__ __launch_bounds__(256, 3)
 void flash_attention_v4_kernel(
     const float* Q, const float* K, const float* V,
     float* O,
@@ -58,14 +62,17 @@ void flash_attention_v4_kernel(
     float mi = -1e9f;
     float li = 0.0f;
 
-    // K/V in shared memory (no padding: cooperative loading is bank-conflict-free)
+    // K/V in shared memory — only 8KB with Bc=16
     __shared__ float Ks[Bc][64];
     __shared__ float Vs[Bc][64];
 
     // Each thread holds HALF of Q row and HALF of O row → 32+32 = 64 regs (vs K3's 128)
     float Qi_half[32];
-    float Oi_half[32] = {0.0f};
+    float Oi_half[32];
     float scale = 1.0f / sqrtf((float)d);
+
+    // Zero-init Oi_half
+    for (int i = 0; i < half_d; i++) Oi_half[i] = 0.0f;
 
     // Load Q half-row into registers
     if (q_row < N) {
@@ -77,8 +84,8 @@ void flash_attention_v4_kernel(
     }
 
     for (int kv_tile = 0; kv_tile < Tc; kv_tile++) {
-        // Cooperative load: all 256 threads load Bc*d = 2048 values
-        // → 8 values per thread (vs K3's 16 with 128 threads)
+        // Cooperative load: all 256 threads load Bc*d = 16*64 = 1024 values
+        // → 4 values per thread (very fast)
         int tile_base = kv_tile * Bc;
         int total_elems = Bc * d;
         int threads = Br * WARP_D;  // 256
