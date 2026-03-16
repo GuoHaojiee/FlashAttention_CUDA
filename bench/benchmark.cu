@@ -32,6 +32,9 @@ extern "C" {
     void flash_attention_v4(
         const float*, const float*, const float*,
         float*, int, int, int);
+    void flash_attention_v5(
+        const float*, const float*, const float*,
+        float*, int, int, int);
 }
 
 static void rand_fill(float* buf, int n) {
@@ -140,7 +143,7 @@ static void bench_one_n(int bh, int N, int d, FILE* csv) {
     cudaMemcpy(dV, hV, nd, cudaMemcpyHostToDevice);
 
     float t[REPEAT];
-    struct Result res[5];
+    struct Result res[6];
 
     // DRAM traffic (theoretical)
     long long bytes_k0    = dram_k0_bytes(bh, N, d);
@@ -188,15 +191,23 @@ static void bench_one_n(int bh, int N, int d, FILE* csv) {
     res[4].dram_mb = (float)((double)bytes_flash / 1e6);
     res[4].err     = max_abs_err(hO, hO_ref, bh * N * d);
 
+    COLLECT_TIMES(t, flash_attention_v5(dQ, dK, dV, dO, bh, N, d));
+    cudaMemcpy(hO, dO, nd, cudaMemcpyDeviceToHost);
+    compute_stats(t, &res[5].mean_ms, &res[5].sd_ms);
+    res[5].name    = "K5: +2PhaseExpILP   ";
+    res[5].bw      = bw_from_bytes(res[5].mean_ms, bytes_flash);
+    res[5].dram_mb = (float)((double)bytes_flash / 1e6);
+    res[5].err     = max_abs_err(hO, hO_ref, bh * N * d);
+
     // print
     float base = res[0].mean_ms;
-    printf("N=%-5d  d=%-3d  bh=%d  block=(32,32)=1024threads  Bc=32\n", N, d, bh);
+    printf("N=%-5d  d=%-3d  bh=%d  Br=32  Bc=32\n", N, d, bh);
     printf("  %-22s  %9s %7s  %9s  %9s %6s  %8s  %10s  %5s\n",
            "Kernel", "Mean(ms)", "Std(ms)",
            "DRAM(MB)", "BW(GB/s)", "Util%", "Speedup", "MaxAbsErr", "Pass");
     printf("  %.104s\n",
            "--------------------------------------------------------------------------------------------------------");
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < 6; i++) {
         const char* pass = (i == 0) ? " ref"
                          : (res[i].err < 1e-2f ? " YES" : "  NO");
         float util = res[i].bw / P100_BW_GBs * 100.0f;
@@ -210,7 +221,7 @@ static void bench_one_n(int bh, int N, int d, FILE* csv) {
     }
     printf("\n");
 
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < 6; i++) {
         const char* pass = (i == 0) ? "ref"
                          : (res[i].err < 1e-2f ? "YES" : "NO");
         fprintf(csv, "%d,%d,%d,%d,%s,%.4f,%.4f,%.1f,%.2f,%.4f,%.2e,%s\n",

@@ -14,7 +14,8 @@ KERNELS  = naive_attention \
            flash_attention_v1 \
            flash_attention_v2 \
            flash_attention_v3 \
-           flash_attention_v4
+           flash_attention_v4 \
+           flash_attention_v5
 
 LIBS     = $(addprefix $(OUT_DIR)/, $(addsuffix .so, $(KERNELS)))
 BENCH    = $(OUT_DIR)/benchmark
@@ -33,6 +34,7 @@ bench: check-nvcc $(OUT_DIR)
 	    $(SRC_DIR)/flash_attention_v2.cu \
 	    $(SRC_DIR)/flash_attention_v3.cu \
 	    $(SRC_DIR)/flash_attention_v4.cu \
+	    $(SRC_DIR)/flash_attention_v5.cu \
 	    -o $(BENCH)
 	@echo "编译完成：$(BENCH)"
 	@echo "运行：./$(BENCH)"
@@ -46,6 +48,7 @@ $(BENCH): bench/benchmark.cu $(addprefix $(SRC_DIR)/, $(addsuffix .cu, $(KERNELS
 	    $(SRC_DIR)/flash_attention_v2.cu \
 	    $(SRC_DIR)/flash_attention_v3.cu \
 	    $(SRC_DIR)/flash_attention_v4.cu \
+	    $(SRC_DIR)/flash_attention_v5.cu \
 	    -o $(BENCH)
 
 # 各 kernel 的独立 .so（保留，供其他工具/ctypes 使用）
@@ -69,6 +72,7 @@ k1: check-nvcc $(OUT_DIR); $(NVCC) $(SOFLAGS) $(SRC_DIR)/flash_attention_v1.cu -
 k2: check-nvcc $(OUT_DIR); $(NVCC) $(SOFLAGS) $(SRC_DIR)/flash_attention_v2.cu -o $(OUT_DIR)/flash_attention_v2.so
 k3: check-nvcc $(OUT_DIR); $(NVCC) $(SOFLAGS) $(SRC_DIR)/flash_attention_v3.cu -o $(OUT_DIR)/flash_attention_v3.so
 k4: check-nvcc $(OUT_DIR); $(NVCC) $(SOFLAGS) $(SRC_DIR)/flash_attention_v4.cu -o $(OUT_DIR)/flash_attention_v4.so
+k5: check-nvcc $(OUT_DIR); $(NVCC) $(SOFLAGS) $(SRC_DIR)/flash_attention_v5.cu -o $(OUT_DIR)/flash_attention_v5.so
 
 # 集群常用命令：
 #   module load cuda/10.2
