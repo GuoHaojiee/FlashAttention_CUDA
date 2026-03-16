@@ -1,36 +1,41 @@
 #include <cuda_runtime.h>
 #include <math.h>
 
-#define Br 64
-#define Bc 16
+#define Br 32
+#define Bc 32
 
-// K1: Basic FlashAttention — Tiling + Online Softmax
+// K1: Basic FlashAttention — Tiling + Online Softmax + Warp-parallel dot products
 //
-// Optimizations (vs naive):
-//   - Tiling: Q in tiles of Br, K/V in tiles of Bc → O(N*d) DRAM, no N×N matrix
-//   - Online softmax: running max/sum in registers, single pass over K/V tiles
-//   - Qi in registers: each thread owns one Q row → no shared memory for Q
-//   - l/m in registers: no HBM round-trips inside the kv loop
-//   - Bc=16: reduces ss[] from 32 to 16 registers, allowing more blocks/SM
+// Key architecture change vs old K1:
+//   OLD: blockDim = (Br), 1 thread per Q row, serial d=64 dot product → 0.2 GB/s
+//   NEW: blockDim = (32, Br), 32 threads (1 warp) per Q row, parallel dot product
 //
-// What's NOT optimized here (saved for K2+):
-//   - No float4 vectorized loads
-//   - K/V loading: only first Bc threads load (no cooperative loading)
+// Each warp handles one Q row:
+//   - lane = threadIdx.x (0..31): which slice of d dimension
+//   - row  = threadIdx.y (0..Br-1): which Q row within the tile
+//   - Each lane loads d/32 = 2 elements of Qi, computes partial dot products,
+//     then warp-reduces via __shfl_down_sync
+//
+// Shared memory layout:
+//   Ks[Bc][d] = 32×64×4 = 8KB
+//   Vs[Bc][d] = 32×64×4 = 8KB
+//   Total = 16KB → 48KB/16KB = 3 blocks/SM
 //
 // Occupancy analysis (P100, sm_60):
-//   Registers: Qi[64]+Oi[64]+ss[16]+misc ≈ 154/thread
-//   Shared: Ks[16][64]+Vs[16][64] = 8KB
-//   __launch_bounds__(64,6) → compiler targets ≤170 regs
-//   65536/(154×64) = 6.6 → 6 blocks (regs), 48KB/8KB = 6 blocks (shared) → 6 blocks/SM
-//   6×64 = 384 threads/SM = 12 warps = 18.75% occupancy
-//
-// grid = (Tr, bh): blockIdx.x = Q tile, blockIdx.y = head
-// blockDim = Br = 64 threads; first Bc=16 threads load K/V tiles
+//   blockDim = 32×32 = 1024 threads
+//   Registers: each thread holds ~15 values (2 Qi + 2 Oi + loop vars + ss partial)
+//     → ~20 regs/thread
+//   65536/(20×1024) = 3.2 → 3 blocks from regs
+//   48KB/16KB = 3 blocks from shared
+//   2048/1024 = 2 blocks from max threads/SM → 2 blocks/SM
+//   2×1024 = 2048 threads/SM = 64 warps = 100% occupancy!
 
-__global__ __launch_bounds__(64, 6)
+__global__ __launch_bounds__(1024, 2)
 void flash_attention_v1_kernel(
-    const float* Q, const float* K, const float* V,
-    float* O,
+    const float* __restrict__ Q,
+    const float* __restrict__ K,
+    const float* __restrict__ V,
+    float* __restrict__ O,
     int bh, int N, int d)
 {
     int bh_idx = blockIdx.y;
@@ -42,84 +47,108 @@ void flash_attention_v1_kernel(
     const float* Qh = Q + (size_t)bh_idx * N * d;
     const float* Kh = K + (size_t)bh_idx * N * d;
     const float* Vh = V + (size_t)bh_idx * N * d;
-    float* Oh = O + (size_t)bh_idx * N * d;
+    float*       Oh = O + (size_t)bh_idx * N * d;
 
-    int tid   = threadIdx.x;   // 0..Br-1
-    int q_row = q_tile * Br + tid;
+    int lane  = threadIdx.x;  // 0..31 (within warp)
+    int row   = threadIdx.y;  // 0..Br-1 (which Q row)
+    int q_row = q_tile * Br + row;
 
-    // l/m in registers: no HBM round-trips
+    float scale = 1.0f / sqrtf((float)d);
+
+    // Online softmax state — per row, but all lanes compute identical values
     float mi = -1e9f;
     float li = 0.0f;
 
-    // Only K/V in shared memory (broadcast reads: all threads read same [j][i])
+    // Each lane accumulates its slice of the output
+    // For d=64, each lane handles 2 elements: lane*2 and lane*2+1
+    float Oi0 = 0.0f, Oi1 = 0.0f;
+
+    // Load Qi for this lane's slice
+    float Qi0 = 0.0f, Qi1 = 0.0f;
+    if (q_row < N) {
+        int base = lane * 2;
+        if (base < d)     Qi0 = Qh[q_row * d + base];
+        if (base + 1 < d) Qi1 = Qh[q_row * d + base + 1];
+    }
+
     __shared__ float Ks[Bc][64];
     __shared__ float Vs[Bc][64];
 
-    // Q in registers: each thread owns one row, no sharing needed
-    float Qi[64];
-    float Oi[64];
-    float scale  = 1.0f / sqrtf((float)d);
-
-    // Zero-init Oi
-    for (int i = 0; i < d; i++) Oi[i] = 0.0f;
-
-    // Load Q row into registers
-    if (q_row < N) {
-        for (int i = 0; i < d; i++) Qi[i] = Qh[q_row * d + i];
-    } else {
-        for (int i = 0; i < d; i++) Qi[i] = 0.0f;
-    }
-
     for (int kv_tile = 0; kv_tile < Tc; kv_tile++) {
-        // Load K/V tile: first Bc threads each load one row
-        if (tid < Bc) {
-            int kv_row = kv_tile * Bc + tid;
-            if (kv_row < N) {
-                for (int i = 0; i < d; i++) {
-                    Ks[tid][i] = Kh[kv_row * d + i];
-                    Vs[tid][i] = Vh[kv_row * d + i];
-                }
-            } else {
-                for (int i = 0; i < d; i++) { Ks[tid][i] = 0.0f; Vs[tid][i] = 0.0f; }
+        // Cooperative load K/V tile: 1024 threads load Bc*d = 2048 values
+        // → 2 values per thread
+        {
+            int total = Bc * d;  // 2048
+            int tid_flat = row * 32 + lane;  // 0..1023
+            for (int idx = tid_flat; idx < total; idx += 1024) {
+                int r = idx / d;   // which KV row within tile
+                int c = idx % d;   // which d column
+                int kv_row = kv_tile * Bc + r;
+                Ks[r][c] = (kv_row < N) ? Kh[kv_row * d + c] : 0.0f;
+                Vs[r][c] = (kv_row < N) ? Vh[kv_row * d + c] : 0.0f;
             }
         }
         __syncthreads();
 
-        // S = Q @ K^T * scale — scores in registers (thread-private)
-        float ss[Bc];
+        // For each KV row j in this tile: compute dot product, online softmax, accumulate O
+        // Process one j at a time to minimize register pressure
+        float new_mi = mi;
+
+        // First pass: compute all scores and find new max
+        // We process scores one at a time to avoid needing ss[Bc] array
         for (int j = 0; j < Bc; j++) {
+            // Parallel dot product: each lane computes partial sum
+            int base = lane * 2;
             float s = 0.0f;
-            for (int i = 0; i < d; i++) s += Qi[i] * Ks[j][i];
-            ss[j] = s * scale;
+            if (base < d)     s += Qi0 * Ks[j][base];
+            if (base + 1 < d) s += Qi1 * Ks[j][base + 1];
+
+            // Warp reduce sum
+            for (int offset = 16; offset > 0; offset >>= 1)
+                s += __shfl_down_sync(0xffffffff, s, offset);
+            // Broadcast from lane 0 to all lanes
+            s = __shfl_sync(0xffffffff, s, 0);
+            s *= scale;
+
+            new_mi = fmaxf(new_mi, s);
         }
 
-        // Online softmax (l/m in registers — never touch HBM)
-        float mj = mi;
-        for (int j = 0; j < Bc; j++) mj = fmaxf(mj, ss[j]);
+        // Rescale old accumulator
+        float alpha = expf(mi - new_mi);
+        Oi0 *= alpha;
+        Oi1 *= alpha;
+        li *= alpha;
 
-        float lj = 0.0f;
+        // Second pass: compute exp(s - new_mi) and accumulate
         for (int j = 0; j < Bc; j++) {
-            ss[j] = expf(ss[j] - mj);
-            lj += ss[j];
+            int base = lane * 2;
+            float s = 0.0f;
+            if (base < d)     s += Qi0 * Ks[j][base];
+            if (base + 1 < d) s += Qi1 * Ks[j][base + 1];
+
+            for (int offset = 16; offset > 0; offset >>= 1)
+                s += __shfl_down_sync(0xffffffff, s, offset);
+            s = __shfl_sync(0xffffffff, s, 0);
+            s *= scale;
+
+            float p = expf(s - new_mi);
+            li += p;
+
+            // Accumulate O: each lane updates its own d-slice
+            if (base < d)     Oi0 += p * Vs[j][base];
+            if (base + 1 < d) Oi1 += p * Vs[j][base + 1];
         }
 
-        float alpha  = expf(mi - mj);
-        float li_new = li * alpha + lj;
-
-        // Rescale accumulated O, then add this tile's contribution
-        for (int i = 0; i < d; i++) Oi[i] *= alpha;
-        for (int j = 0; j < Bc; j++) {
-            float esj = ss[j];
-            for (int i = 0; i < d; i++) Oi[i] += esj * Vs[j][i];
-        }
-
-        mi = mj;
-        li = li_new;
+        mi = new_mi;
         __syncthreads();
     }
 
+    // Write output
     if (q_row < N) {
-        for (int i = 0; i < d; i++) Oh[q_row * d + i] = Oi[i] / li;
+        int base = lane * 2;
+        float inv_li = 1.0f / li;
+        if (base < d)     Oh[q_row * d + base]     = Oi0 * inv_li;
+        if (base + 1 < d) Oh[q_row * d + base + 1] = Oi1 * inv_li;
     }
 }
 
@@ -130,6 +159,7 @@ extern "C" void flash_attention_v1(
 {
     int Tr = (N + Br - 1) / Br;
     dim3 grid(Tr, bh);
-    flash_attention_v1_kernel<<<grid, Br>>>(Q, K, V, O, bh, N, d);
+    dim3 block(32, Br);  // 32 lanes × Br rows = 1024 threads
+    flash_attention_v1_kernel<<<grid, block>>>(Q, K, V, O, bh, N, d);
     cudaDeviceSynchronize();
 }

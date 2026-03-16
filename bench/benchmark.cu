@@ -190,7 +190,7 @@ static void bench_one_n(int bh, int N, int d, FILE* csv) {
 
     // print
     float base = res[0].mean_ms;
-    printf("N=%-5d  d=%-3d  bh=%d  Bc=16  Br: K1=64, K2/K3/K4=128\n", N, d, bh);
+    printf("N=%-5d  d=%-3d  bh=%d  block=(32,32)=1024threads  Bc=32\n", N, d, bh);
     printf("  %-22s  %9s %7s  %9s  %9s %6s  %8s  %10s  %5s\n",
            "Kernel", "Mean(ms)", "Std(ms)",
            "DRAM(MB)", "BW(GB/s)", "Util%", "Speedup", "MaxAbsErr", "Pass");

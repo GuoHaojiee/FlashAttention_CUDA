@@ -1,38 +1,30 @@
 #include <cuda_runtime.h>
 #include <math.h>
 
-#define Br 128
-#define Bc 16
+#define Br 32
+#define Bc 32
 
-// K3: Optimization over K2 — cooperative K/V loading across all threads.
+// K3: FlashAttention + Warp-parallel + Single-pass fused online softmax
 //
-// In K2, only the first Bc=16 threads load K/V (the other 112 idle during loading).
-// Here, all Br=128 threads participate via linear-index cooperative loading:
-//   for (idx = tid; idx < Bc*d; idx += Br)
-//     Ks[idx/d][idx%d] = Kh[...]
+// Improvement over K2:
+//   K1/K2 use a TWO-PASS approach per KV tile:
+//     Pass 1: compute all dot products to find new max
+//     Pass 2: compute exp and accumulate O
+//   This means each Ks[j][*] is read TWICE from shared memory.
 //
-// Benefits:
-//   1. 8x faster loading (128 threads vs 16)
-//   2. Naturally coalesced: consecutive threads access consecutive addresses
-//   3. Naturally bank-conflict-free for writes: consecutive threads write
-//      consecutive shared memory addresses → each thread hits a different bank
-//      (bank = idx % 32, and consecutive tids have consecutive idx values)
+//   K3 uses a SINGLE-PASS fused approach:
+//     For each j, compute dot product, update running max, rescale, accumulate.
+//     Each Ks[j][*] and Vs[j][*] read only ONCE.
+//     Trade-off: one extra rescale per j, but saves 50% shared memory reads.
 //
-// Also uses Bc=16 (matching K2) for reduced register pressure (ss[16]).
-//
-// Occupancy analysis (P100, sm_60):
-//   Registers: Qi[64]+Oi[64]+ss[16]+misc ≈ 154/thread
-//   Shared: Ks[16][64]+Vs[16][64] = 8KB
-//   __launch_bounds__(128,4) → compiler targets ≤128 regs
-//   48KB/8KB = 6 blocks (shared), launch_bounds caps at 4 → 4 blocks/SM
-//   4×128 = 512 threads/SM = 16 warps = 25% occupancy
-//
-// grid = (Tr, bh), blockDim = Br = 128
+// Same warp-per-row architecture: blockDim = (32, Br) = 1024 threads.
 
-__global__ __launch_bounds__(128, 4)
+__global__ __launch_bounds__(1024, 2)
 void flash_attention_v3_kernel(
-    const float* Q, const float* K, const float* V,
-    float* O,
+    const float* __restrict__ Q,
+    const float* __restrict__ K,
+    const float* __restrict__ V,
+    float* __restrict__ O,
     int bh, int N, int d)
 {
     int bh_idx = blockIdx.y;
@@ -44,86 +36,76 @@ void flash_attention_v3_kernel(
     const float* Qh = Q + (size_t)bh_idx * N * d;
     const float* Kh = K + (size_t)bh_idx * N * d;
     const float* Vh = V + (size_t)bh_idx * N * d;
-    float* Oh = O + (size_t)bh_idx * N * d;
+    float*       Oh = O + (size_t)bh_idx * N * d;
 
-    int tid   = threadIdx.x;
-    int q_row = q_tile * Br + tid;
+    int lane  = threadIdx.x;  // 0..31
+    int row   = threadIdx.y;  // 0..Br-1
+    int q_row = q_tile * Br + row;
+
+    float scale = 1.0f / sqrtf((float)d);
 
     float mi = -1e9f;
     float li = 0.0f;
+    float Oi0 = 0.0f, Oi1 = 0.0f;
 
-    // Shared memory for K/V tiles — only 8KB total with Bc=16
+    float Qi0 = 0.0f, Qi1 = 0.0f;
+    if (q_row < N) {
+        int base = lane * 2;
+        if (base < d)     Qi0 = Qh[q_row * d + base];
+        if (base + 1 < d) Qi1 = Qh[q_row * d + base + 1];
+    }
+
     __shared__ float Ks[Bc][64];
     __shared__ float Vs[Bc][64];
 
-    float Qi[64];
-    float Oi[64];
-    float scale  = 1.0f / sqrtf((float)d);
-    int d4 = d / 4;
-
-    // Zero-init Oi
-    for (int i = 0; i < d; i++) Oi[i] = 0.0f;
-
-    // Load Q row into registers (float4)
-    if (q_row < N) {
-        const float4* Q4 = reinterpret_cast<const float4*>(Qh + q_row * d);
-        float4* Qi4 = reinterpret_cast<float4*>(Qi);
-        for (int i = 0; i < d4; i++) Qi4[i] = Q4[i];
-    } else {
-        for (int i = 0; i < d; i++) Qi[i] = 0.0f;
-    }
-
     for (int kv_tile = 0; kv_tile < Tc; kv_tile++) {
-        // Cooperative load: all Br=128 threads share the work of loading
-        // Bc*d = 16*64 = 1024 values → 8 values per thread
-        // Linear indexing: thread tid loads elements tid, tid+128, tid+256, ...
-        // → consecutive threads access consecutive addresses → coalesced + no bank conflict
-        int tile_base = kv_tile * Bc;
-        for (int idx = tid; idx < Bc * d; idx += Br) {
-            int r = idx / d;
-            int c = idx % d;
-            int kv_row = tile_base + r;
-            float kval = (kv_row < N) ? Kh[kv_row * d + c] : 0.0f;
-            float vval = (kv_row < N) ? Vh[kv_row * d + c] : 0.0f;
-            Ks[r][c] = kval;
-            Vs[r][c] = vval;
+        // Cooperative load
+        {
+            int tid_flat = row * 32 + lane;
+            int total = Bc * d;
+            for (int idx = tid_flat; idx < total; idx += 1024) {
+                int r = idx / d;
+                int c = idx % d;
+                int kv_row = kv_tile * Bc + r;
+                Ks[r][c] = (kv_row < N) ? Kh[kv_row * d + c] : 0.0f;
+                Vs[r][c] = (kv_row < N) ? Vh[kv_row * d + c] : 0.0f;
+            }
         }
         __syncthreads();
 
-        // S = Q @ K^T * scale in registers
-        float ss[Bc];
+        // Single-pass fused online softmax: process one j at a time
         for (int j = 0; j < Bc; j++) {
+            int base = lane * 2;
             float s = 0.0f;
-            for (int i = 0; i < d; i++) s += Qi[i] * Ks[j][i];
-            ss[j] = s * scale;
+            if (base < d)     s += Qi0 * Ks[j][base];
+            if (base + 1 < d) s += Qi1 * Ks[j][base + 1];
+
+            // Warp reduce
+            for (int offset = 16; offset > 0; offset >>= 1)
+                s += __shfl_down_sync(0xffffffff, s, offset);
+            s = __shfl_sync(0xffffffff, s, 0);
+            s *= scale;
+
+            // Online softmax update
+            float new_mi = fmaxf(mi, s);
+            float alpha  = expf(mi - new_mi);
+            float p      = expf(s - new_mi);
+
+            // Rescale running accumulator and add new contribution
+            Oi0 = Oi0 * alpha + p * ((base < d)     ? Vs[j][base]     : 0.0f);
+            Oi1 = Oi1 * alpha + p * ((base + 1 < d) ? Vs[j][base + 1] : 0.0f);
+            li = li * alpha + p;
+            mi = new_mi;
         }
 
-        // Online softmax
-        float mj = mi;
-        for (int j = 0; j < Bc; j++) mj = fmaxf(mj, ss[j]);
-
-        float lj = 0.0f;
-        for (int j = 0; j < Bc; j++) {
-            ss[j] = expf(ss[j] - mj);
-            lj += ss[j];
-        }
-
-        float alpha  = expf(mi - mj);
-        float li_new = li * alpha + lj;
-
-        for (int i = 0; i < d; i++) Oi[i] *= alpha;
-        for (int j = 0; j < Bc; j++) {
-            float esj = ss[j];
-            for (int i = 0; i < d; i++) Oi[i] += esj * Vs[j][i];
-        }
-
-        mi = mj;
-        li = li_new;
         __syncthreads();
     }
 
     if (q_row < N) {
-        for (int i = 0; i < d; i++) Oh[q_row * d + i] = Oi[i] / li;
+        int base = lane * 2;
+        float inv_li = 1.0f / li;
+        if (base < d)     Oh[q_row * d + base]     = Oi0 * inv_li;
+        if (base + 1 < d) Oh[q_row * d + base + 1] = Oi1 * inv_li;
     }
 }
 
@@ -134,6 +116,7 @@ extern "C" void flash_attention_v3(
 {
     int Tr = (N + Br - 1) / Br;
     dim3 grid(Tr, bh);
-    flash_attention_v3_kernel<<<grid, Br>>>(Q, K, V, O, bh, N, d);
+    dim3 block(32, Br);
+    flash_attention_v3_kernel<<<grid, block>>>(Q, K, V, O, bh, N, d);
     cudaDeviceSynchronize();
 }

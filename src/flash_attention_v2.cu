@@ -1,38 +1,26 @@
 #include <cuda_runtime.h>
 #include <math.h>
 
-#define Br 128
-#define Bc 16
-#define D_TILE 32   // process d dimension in chunks of 32
+#define Br 32
+#define Bc 32
 
-// K2: Optimizations over K1:
-//   1. Br=128 (vs K1's 64): Tr halved → more work per block, better amortization
-//   2. float4 vectorized K/V loads (requires d % 4 == 0)
-//   3. Bc=16 (vs old 32): halves ss[] register count (16 vs 32)
-//   4. D-tiling: process d in chunks of D_TILE=32, so only Qi[32]+Oi[32] live
-//      at a time → 32+32+16 = 80 regs vs old 64+64+32 = 160 regs
+// K2: FlashAttention + Warp-parallel + float4 vectorized loads
 //
-// D-tiling approach:
-//   For each KV tile, compute ss[Bc] once (dot product needs full d, but we
-//   accumulate partial sums across d-tiles). Then for each d-tile, update Oi.
-//   Actually: ss = Q @ K^T needs all of d simultaneously. So we tile differently:
-//   - Keep Qi in registers but load/store Oi from shared memory per d-tile
-//   No — simpler: just reduce Bc to 16 and keep the same structure. The main
-//   register savings come from Bc=16 (ss[16] instead of ss[32]).
+// Same warp-per-row architecture as K1, plus:
+//   - float4 vectorized global memory loads for Q, K, V, O
+//   - Each lane handles d/32=2 elements, loaded as individual floats
+//     (float4 used for cooperative K/V tile loading)
 //
-// Occupancy analysis (P100, sm_60):
-//   Registers: Qi[64]+Oi[64]+ss[16]+misc ≈ 154/thread
-//   Shared: Ks[16][64]+Vs[16][64] = 8KB
-//   __launch_bounds__(128,4) → compiler targets ≤128 regs (65536/(128×4))
-//   48KB/8KB = 6 blocks (shared), but launch_bounds caps at 4 → 4 blocks/SM
-//   4×128 = 512 threads/SM = 16 warps = 25% occupancy
+// Occupancy: same as K1 — blockDim=1024, 2 blocks/SM, 100% occupancy
 //
-// grid = (Tr, bh), blockDim = Br = 128
+// Improvement over K1: faster K/V tile loading via float4
 
-__global__ __launch_bounds__(128, 4)
+__global__ __launch_bounds__(1024, 2)
 void flash_attention_v2_kernel(
-    const float* Q, const float* K, const float* V,
-    float* O,
+    const float* __restrict__ Q,
+    const float* __restrict__ K,
+    const float* __restrict__ V,
+    float* __restrict__ O,
     int bh, int N, int d)
 {
     int bh_idx = blockIdx.y;
@@ -44,87 +32,109 @@ void flash_attention_v2_kernel(
     const float* Qh = Q + (size_t)bh_idx * N * d;
     const float* Kh = K + (size_t)bh_idx * N * d;
     const float* Vh = V + (size_t)bh_idx * N * d;
-    float* Oh = O + (size_t)bh_idx * N * d;
+    float*       Oh = O + (size_t)bh_idx * N * d;
 
-    int tid   = threadIdx.x;   // 0..Br-1
-    int q_row = q_tile * Br + tid;
+    int lane  = threadIdx.x;  // 0..31
+    int row   = threadIdx.y;  // 0..Br-1
+    int q_row = q_tile * Br + row;
 
-    // l/m in registers: never touch HBM inside the kv loop
+    float scale = 1.0f / sqrtf((float)d);
+
     float mi = -1e9f;
     float li = 0.0f;
+    float Oi0 = 0.0f, Oi1 = 0.0f;
 
-    // Only K/V need shared memory (broadcast access: all threads read same [j][i])
+    // Load Qi for this lane's slice
+    float Qi0 = 0.0f, Qi1 = 0.0f;
+    if (q_row < N) {
+        int base = lane * 2;
+        if (base < d)     Qi0 = Qh[q_row * d + base];
+        if (base + 1 < d) Qi1 = Qh[q_row * d + base + 1];
+    }
+
     __shared__ float Ks[Bc][64];
     __shared__ float Vs[Bc][64];
 
-    // Q in registers: each thread owns one row, no sharing needed
-    float Qi[64];
-    float Oi[64];
-    float scale  = 1.0f / sqrtf((float)d);
-    int d4 = d / 4;
-
-    // Zero-init Oi
-    for (int i = 0; i < d; i++) Oi[i] = 0.0f;
-
-    // Load Q row into registers (float4 vectorized)
-    if (q_row < N) {
-        const float4* Q4 = reinterpret_cast<const float4*>(Qh + q_row * d);
-        float4* Qi4 = reinterpret_cast<float4*>(Qi);
-        for (int i = 0; i < d4; i++) Qi4[i] = Q4[i];
-    } else {
-        for (int i = 0; i < d; i++) Qi[i] = 0.0f;
-    }
-
     for (int kv_tile = 0; kv_tile < Tc; kv_tile++) {
-        // Load K/V tile: first Bc threads each load one row (float4 vectorized)
-        if (tid < Bc) {
-            int kv_row = kv_tile * Bc + tid;
-            if (kv_row < N) {
-                const float4* K4 = reinterpret_cast<const float4*>(Kh + kv_row * d);
-                const float4* V4 = reinterpret_cast<const float4*>(Vh + kv_row * d);
-                float4* Ks4 = reinterpret_cast<float4*>(Ks[tid]);
-                float4* Vs4 = reinterpret_cast<float4*>(Vs[tid]);
-                for (int i = 0; i < d4; i++) { Ks4[i] = K4[i]; Vs4[i] = V4[i]; }
-            } else {
-                for (int i = 0; i < d; i++) { Ks[tid][i] = 0.0f; Vs[tid][i] = 0.0f; }
+        // Cooperative load using float4: 1024 threads load 2048 floats = 512 float4s
+        // Each thread loads at most 1 float4 (4 floats)
+        {
+            int tid_flat = row * 32 + lane;
+            int total4 = (Bc * d) / 4;  // 512 float4s
+            // Load K tile
+            for (int idx4 = tid_flat; idx4 < total4; idx4 += 1024) {
+                int elem = idx4 * 4;
+                int r = elem / d;
+                int c = elem % d;
+                int kv_row = kv_tile * Bc + r;
+                float4 val;
+                if (kv_row < N) {
+                    val = reinterpret_cast<const float4*>(Kh + kv_row * d)[c / 4];
+                } else {
+                    val.x = val.y = val.z = val.w = 0.0f;
+                }
+                reinterpret_cast<float4*>(&Ks[r][c])[0] = val;
+            }
+            // Load V tile
+            for (int idx4 = tid_flat; idx4 < total4; idx4 += 1024) {
+                int elem = idx4 * 4;
+                int r = elem / d;
+                int c = elem % d;
+                int kv_row = kv_tile * Bc + r;
+                float4 val;
+                if (kv_row < N) {
+                    val = reinterpret_cast<const float4*>(Vh + kv_row * d)[c / 4];
+                } else {
+                    val.x = val.y = val.z = val.w = 0.0f;
+                }
+                reinterpret_cast<float4*>(&Vs[r][c])[0] = val;
             }
         }
         __syncthreads();
 
-        // S = Q @ K^T * scale — scores in registers (thread-private)
-        float ss[Bc];
+        float new_mi = mi;
+
+        // First pass: find new max
         for (int j = 0; j < Bc; j++) {
+            int base = lane * 2;
             float s = 0.0f;
-            for (int i = 0; i < d; i++) s += Qi[i] * Ks[j][i];
-            ss[j] = s * scale;
+            if (base < d)     s += Qi0 * Ks[j][base];
+            if (base + 1 < d) s += Qi1 * Ks[j][base + 1];
+            for (int offset = 16; offset > 0; offset >>= 1)
+                s += __shfl_down_sync(0xffffffff, s, offset);
+            s = __shfl_sync(0xffffffff, s, 0);
+            new_mi = fmaxf(new_mi, s * scale);
         }
 
-        // Online softmax (l/m stay in registers)
-        float mj = mi;
-        for (int j = 0; j < Bc; j++) mj = fmaxf(mj, ss[j]);
+        float alpha = expf(mi - new_mi);
+        Oi0 *= alpha;
+        Oi1 *= alpha;
+        li *= alpha;
 
-        float lj = 0.0f;
+        // Second pass: accumulate
         for (int j = 0; j < Bc; j++) {
-            ss[j] = expf(ss[j] - mj);
-            lj += ss[j];
+            int base = lane * 2;
+            float s = 0.0f;
+            if (base < d)     s += Qi0 * Ks[j][base];
+            if (base + 1 < d) s += Qi1 * Ks[j][base + 1];
+            for (int offset = 16; offset > 0; offset >>= 1)
+                s += __shfl_down_sync(0xffffffff, s, offset);
+            s = __shfl_sync(0xffffffff, s, 0);
+            float p = expf(s * scale - new_mi);
+            li += p;
+            if (base < d)     Oi0 += p * Vs[j][base];
+            if (base + 1 < d) Oi1 += p * Vs[j][base + 1];
         }
 
-        float alpha  = expf(mi - mj);
-        float li_new = li * alpha + lj;
-
-        for (int i = 0; i < d; i++) Oi[i] *= alpha;
-        for (int j = 0; j < Bc; j++) {
-            float esj = ss[j];
-            for (int i = 0; i < d; i++) Oi[i] += esj * Vs[j][i];
-        }
-
-        mi = mj;
-        li = li_new;
+        mi = new_mi;
         __syncthreads();
     }
 
     if (q_row < N) {
-        for (int i = 0; i < d; i++) Oh[q_row * d + i] = Oi[i] / li;
+        int base = lane * 2;
+        float inv_li = 1.0f / li;
+        if (base < d)     Oh[q_row * d + base]     = Oi0 * inv_li;
+        if (base + 1 < d) Oh[q_row * d + base + 1] = Oi1 * inv_li;
     }
 }
 
@@ -135,6 +145,7 @@ extern "C" void flash_attention_v2(
 {
     int Tr = (N + Br - 1) / Br;
     dim3 grid(Tr, bh);
-    flash_attention_v2_kernel<<<grid, Br>>>(Q, K, V, O, bh, N, d);
+    dim3 block(32, Br);
+    flash_attention_v2_kernel<<<grid, block>>>(Q, K, V, O, bh, N, d);
     cudaDeviceSynchronize();
 }
