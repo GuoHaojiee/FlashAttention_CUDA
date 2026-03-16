@@ -5,19 +5,23 @@
 #define Bc 32
 
 // K2: Optimizations over K1:
-//   1. Br=128 (vs K1's 64): Tr halved → K/V re-reads halved → ~4x less DRAM than naive
-//   2. Q in registers: each thread only reads its own Q row, no cross-thread sharing
-//      → saves Br*d*4 = 32KB shared memory → 3 blocks/SM (vs K1's 1 block/SM)
-//   3. l/m in registers: no HBM round-trips inside the kv loop
-//   4. float4 vectorized K/V loads (requires d % 4 == 0)
+//   1. Br=128 (vs K1's 64): Tr halved → more work per block, better amortization
+//   2. float4 vectorized K/V loads (requires d % 4 == 0)
 //
-// Shared memory: Ks[32][64] + Vs[32][64] = 16KB
-// Registers per thread: Qi[64] + Oi[64] + ss[32] + misc ≈ 170
-// Occupancy: 3 blocks/SM × 128 threads = 384 threads/SM = 18.75% (vs K1's 3.1%)
+// Occupancy analysis (P100, sm_60):
+//   Registers: Qi[64]+Oi[64]+ss[32]+misc ≈ 170/thread
+//   Shared: Ks[32][64]+Vs[32][64] = 16KB
+//   __launch_bounds__(128,3) → compiler targets ≤170 regs (65536/(128×3) = 170)
+//   48KB/16KB = 3 blocks (shared) → 3 blocks/SM
+//   3×128 = 384 threads/SM = 12 warps = 18.75% occupancy
+//
+// Without __launch_bounds__, compiler may use ~180-200 regs → only 2 blocks → 12.5%
+// The hint saves ~33% occupancy and prevents the massive K2 slowdown at large N.
 //
 // grid = (Tr, bh), blockDim = Br = 128
 
-__global__ void flash_attention_v2_kernel(
+__global__ __launch_bounds__(128, 3)
+void flash_attention_v2_kernel(
     const float* Q, const float* K, const float* V,
     float* O,
     int bh, int N, int d)

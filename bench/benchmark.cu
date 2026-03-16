@@ -22,7 +22,7 @@ extern "C" {
         float*, float*, int, int, int);
     void flash_attention_v1(
         const float*, const float*, const float*,
-        float*, float*, float*, int, int, int);
+        float*, int, int, int);
     void flash_attention_v2(
         const float*, const float*, const float*,
         float*, int, int, int);
@@ -130,12 +130,10 @@ static void bench_one_n(int bh, int N, int d, FILE* csv) {
     rand_fill(hK, bh * N * d);
     rand_fill(hV, bh * N * d);
 
-    float *dQ, *dK, *dV, *dO, *dS, *dl, *dm;
+    float *dQ, *dK, *dV, *dO, *dS;
     cudaMalloc(&dQ, nd); cudaMalloc(&dK, nd); cudaMalloc(&dV, nd);
     cudaMalloc(&dO, nd);
     cudaMalloc(&dS, nn);
-    cudaMalloc(&dl, (size_t)bh * N * sizeof(float));
-    cudaMalloc(&dm, (size_t)bh * N * sizeof(float));
 
     cudaMemcpy(dQ, hQ, nd, cudaMemcpyHostToDevice);
     cudaMemcpy(dK, hK, nd, cudaMemcpyHostToDevice);
@@ -158,7 +156,7 @@ static void bench_one_n(int bh, int N, int d, FILE* csv) {
     res[0].dram_mb = (float)((double)bytes_k0 / 1e6);
     res[0].err     = 0.0f;
 
-    COLLECT_TIMES(t, flash_attention_v1(dQ, dK, dV, dO, dl, dm, bh, N, d));
+    COLLECT_TIMES(t, flash_attention_v1(dQ, dK, dV, dO, bh, N, d));
     cudaMemcpy(hO, dO, nd, cudaMemcpyDeviceToHost);
     compute_stats(t, &res[1].mean_ms, &res[1].sd_ms);
     res[1].name    = "K1: Basic FlashAttn ";
@@ -192,7 +190,7 @@ static void bench_one_n(int bh, int N, int d, FILE* csv) {
 
     // print
     float base = res[0].mean_ms;
-    printf("N=%-5d  d=%-3d  bh=%d  Br: K1=64 K2,K3,K4=128\n", N, d, bh);
+    printf("N=%-5d  d=%-3d  bh=%d  Br: K1=64, K2/K3/K4=128\n", N, d, bh);
     printf("  %-22s  %9s %7s  %9s  %9s %6s  %8s  %10s  %5s\n",
            "Kernel", "Mean(ms)", "Std(ms)",
            "DRAM(MB)", "BW(GB/s)", "Util%", "Speedup", "MaxAbsErr", "Pass");
@@ -224,7 +222,7 @@ static void bench_one_n(int bh, int N, int d, FILE* csv) {
     }
 
     cudaFree(dQ); cudaFree(dK); cudaFree(dV);
-    cudaFree(dO); cudaFree(dS); cudaFree(dl); cudaFree(dm);
+    cudaFree(dO); cudaFree(dS);
     free(hQ); free(hK); free(hV); free(hO_ref); free(hO);
 }
 

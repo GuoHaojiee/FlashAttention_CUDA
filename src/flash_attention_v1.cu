@@ -6,25 +6,31 @@
 
 // K1: Basic FlashAttention — Tiling + Online Softmax
 //
-// Key fixes vs flash-attention-minimal (Br=32):
-//   - Br=64 (> d=64) so Tr = N/64, halving K/V re-reads from HBM
-//     (at Br=32, d=64, DRAM ≈ 4N² = same as naive → zero benefit)
-//   - Ss in registers: each thread only reads its own scores, no sharing needed
-//   - Qs padded to stride 65: eliminates 32-way bank conflict
-//     (Qs[Br][64] has bank = (tid*64+i)%32 = i%32 → all threads same bank)
-//     (Qs[Br][65] has bank = (tid*65+i)%32 = (tid+i)%32 → all different)
+// Optimizations (vs naive):
+//   - Tiling: Q in tiles of Br, K/V in tiles of Bc → O(N*d) DRAM, no N×N matrix
+//   - Online softmax: running max/sum in registers, single pass over K/V tiles
+//   - Qi in registers: each thread owns one Q row → no shared memory for Q
+//   - l/m in registers: no HBM round-trips inside the kv loop
 //
-// What's NOT optimized here (saved for K2):
-//   - Qs still in shared memory (could be registers since each thread owns one row)
-//   - l/m still round-trip through HBM each kv_tile
+// What's NOT optimized here (saved for K2+):
 //   - No float4 vectorized loads
+//   - K/V loading: only first Bc threads load (no cooperative loading)
+//   - No bank-conflict padding on Ks/Vs
+//
+// Occupancy analysis (P100, sm_60):
+//   Registers: Qi[64]+Oi[64]+ss[32]+misc ≈ 170/thread
+//   Shared: Ks[32][64]+Vs[32][64] = 16KB
+//   __launch_bounds__(64,3) → compiler targets ≤170 regs
+//   65536/(170×64) = 6 blocks (regs), 48KB/16KB = 3 blocks (shared) → 3 blocks/SM
+//   3×64 = 192 threads/SM = 6 warps = 9.4% occupancy
 //
 // grid = (Tr, bh): blockIdx.x = Q tile, blockIdx.y = head
 // blockDim = Br = 64 threads; first Bc=32 threads load K/V tiles
 
-__global__ void flash_attention_v1_kernel(
+__global__ __launch_bounds__(64, 3)
+void flash_attention_v1_kernel(
     const float* Q, const float* K, const float* V,
-    float* O, float* l, float* m,
+    float* O,
     int bh, int N, int d)
 {
     int bh_idx = blockIdx.y;
@@ -37,31 +43,29 @@ __global__ void flash_attention_v1_kernel(
     const float* Kh = K + (size_t)bh_idx * N * d;
     const float* Vh = V + (size_t)bh_idx * N * d;
     float* Oh = O + (size_t)bh_idx * N * d;
-    float* lh = l + bh_idx * N;
-    float* mh = m + bh_idx * N;
 
     int tid   = threadIdx.x;   // 0..Br-1
     int q_row = q_tile * Br + tid;
 
-    // Qs in shared memory: basic approach (K2 moves it to registers)
-    // Qs padded to stride 65: bank = (tid*65+i)%32 = (tid+i)%32 → conflict-free
-    // Ss NOT in shared memory: each thread only reads its own row → registers
-    __shared__ float Qs[Br][64 + 1];
+    // l/m in registers: no HBM round-trips
+    float mi = -1e9f;
+    float li = 0.0f;
+
+    // Only K/V in shared memory (broadcast reads: all threads read same [j][i])
     __shared__ float Ks[Bc][64];
     __shared__ float Vs[Bc][64];
 
+    // Q in registers: each thread owns one row, no sharing needed
+    float Qi[64];
     float Oi[64] = {0.0f};
     float scale  = 1.0f / sqrtf((float)d);
 
-    // Load Q tile: each of Br threads loads its own row
+    // Load Q row into registers
     if (q_row < N) {
-        for (int i = 0; i < d; i++) Qs[tid][i] = Qh[q_row * d + i];
+        for (int i = 0; i < d; i++) Qi[i] = Qh[q_row * d + i];
     } else {
-        for (int i = 0; i < d; i++) Qs[tid][i] = 0.0f;
+        for (int i = 0; i < d; i++) Qi[i] = 0.0f;
     }
-
-    // K1: l/m in HBM, initialized before the kv loop
-    if (q_row < N) { lh[q_row] = 0.0f; mh[q_row] = -1e9f; }
 
     for (int kv_tile = 0; kv_tile < Tc; kv_tile++) {
         // Load K/V tile: first Bc threads each load one row
@@ -78,22 +82,18 @@ __global__ void flash_attention_v1_kernel(
         }
         __syncthreads();
 
-        // S = Q @ K^T * scale — scores stay in registers (thread-private)
+        // S = Q @ K^T * scale — scores in registers (thread-private)
         float ss[Bc];
         for (int j = 0; j < Bc; j++) {
             float s = 0.0f;
-            for (int i = 0; i < d; i++) s += Qs[tid][i] * Ks[j][i];
+            for (int i = 0; i < d; i++) s += Qi[i] * Ks[j][i];
             ss[j] = s * scale;
         }
 
-        // Online softmax: read l/m from HBM each kv_tile
-        float mi = (q_row < N) ? mh[q_row] : -1e9f;
-        float li = (q_row < N) ? lh[q_row] : 0.0f;
-
+        // Online softmax (l/m in registers — never touch HBM)
         float mj = mi;
         for (int j = 0; j < Bc; j++) mj = fmaxf(mj, ss[j]);
 
-        // Reuse ss[] for exp values
         float lj = 0.0f;
         for (int j = 0; j < Bc; j++) {
             ss[j] = expf(ss[j] - mj);
@@ -110,24 +110,23 @@ __global__ void flash_attention_v1_kernel(
             for (int i = 0; i < d; i++) Oi[i] += esj * Vs[j][i];
         }
 
-        // Write l/m back to HBM
-        if (q_row < N) { mh[q_row] = mj; lh[q_row] = li_new; }
+        mi = mj;
+        li = li_new;
         __syncthreads();
     }
 
     if (q_row < N) {
-        float li_final = lh[q_row];
-        for (int i = 0; i < d; i++) Oh[q_row * d + i] = Oi[i] / li_final;
+        for (int i = 0; i < d; i++) Oh[q_row * d + i] = Oi[i] / li;
     }
 }
 
 extern "C" void flash_attention_v1(
     const float* Q, const float* K, const float* V,
-    float* O, float* l, float* m,
+    float* O,
     int bh, int N, int d)
 {
     int Tr = (N + Br - 1) / Br;
     dim3 grid(Tr, bh);
-    flash_attention_v1_kernel<<<grid, Br>>>(Q, K, V, O, l, m, bh, N, d);
+    flash_attention_v1_kernel<<<grid, Br>>>(Q, K, V, O, bh, N, d);
     cudaDeviceSynchronize();
 }

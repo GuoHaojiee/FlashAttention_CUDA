@@ -3,34 +3,35 @@
 
 #define Br 128
 #define Bc 32
-#define PAD 1
 #define WARP_D 2   // threads per Q row: split d dimension across 2 threads
 
 // K4: Warp d-split tiling — reduce register pressure via d-dimension parallelism
 //
 // Problem in K3:
 //   Each thread holds Qi[64] + Oi[64] + ss[32] = 160 registers (+ misc ≈ 170)
-//   P100: 65536 regs/SM ÷ 170 = 385 threads max → only 1 block of 128 = 128 threads/SM
-//   Occupancy: 128/2048 = 6.25% — severely underutilized
+//   Even with __launch_bounds__(128,3), the compiler must aggressively manage 170 regs
 //
 // Fix: WARP_D=2 threads collaborate on each Q row, each holding half of d:
 //   Thread 2k   holds Qi[0..31],  Oi[0..31]  → 32+32+32 = 96 regs
 //   Thread 2k+1 holds Qi[32..63], Oi[32..63] → 32+32+32 = 96 regs
 //   ss[Bc] is computed via __shfl_xor_sync to sum partial dot products
 //
-//   With ~110 regs/thread: 65536/110 = 595 threads → 2 blocks × 256 = 512 threads/SM
-//   Occupancy: 512/2048 = 25% (vs K3's ~6%)
+// Occupancy analysis (P100, sm_60):
+//   Registers: ~110/thread
+//   Shared: Ks[32][64]+Vs[32][64] = 16KB
+//   __launch_bounds__(256,2) → 65536/(256×2) = 128 regs (plenty for ~110)
+//   48KB/16KB = 3 blocks from shared, 2 blocks from launch_bounds → 2 blocks
+//   2×256 = 512 threads/SM = 16 warps = 25% occupancy
 //
 // Layout:
 //   blockDim = Br * WARP_D = 128 * 2 = 256 threads
-//   tid = threadIdx.x
 //   q_idx = tid / WARP_D     → which Q row (0..127)
 //   d_half = tid % WARP_D    → which half of d (0 or 1)
-//   partner = tid ^ 1        → XOR partner for shuffle reduction
 //
 // grid = (Tr, bh), blockDim = 256
 
-__global__ void flash_attention_v4_kernel(
+__global__ __launch_bounds__(256, 2)
+void flash_attention_v4_kernel(
     const float* Q, const float* K, const float* V,
     float* O,
     int bh, int N, int d)
@@ -57,9 +58,9 @@ __global__ void flash_attention_v4_kernel(
     float mi = -1e9f;
     float li = 0.0f;
 
-    // Padded K/V in shared memory (same as K3)
-    __shared__ float Ks[Bc][64 + PAD];
-    __shared__ float Vs[Bc][64 + PAD];
+    // K/V in shared memory (no padding: cooperative loading is bank-conflict-free)
+    __shared__ float Ks[Bc][64];
+    __shared__ float Vs[Bc][64];
 
     // Each thread holds HALF of Q row and HALF of O row → 32+32 = 64 regs (vs K3's 128)
     float Qi_half[32];

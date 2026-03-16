@@ -3,27 +3,36 @@
 
 #define Br 128
 #define Bc 32
-#define PAD 1
 
-// K3: Optimization over K2 — eliminate bank conflicts during K/V shared memory writes.
+// K3: Optimization over K2 — cooperative K/V loading across all threads.
 //
-// Root cause in K2:
-//   First Bc=32 threads load K/V row-by-row: thread tid writes Ks[tid][i].
-//   Address = tid*64 + i, bank = (tid*64 + i) % 32 = i % 32  (since 64%32=0)
-//   → ALL 32 threads hit bank i%32 at each loop step → 32-way write conflict.
+// In K2, only the first Bc=32 threads load K/V (the other 96 idle during loading).
+// Here, all Br=128 threads participate via linear-index cooperative loading:
+//   for (idx = tid; idx < Bc*d; idx += Br)
+//     Ks[idx/d][idx%d] = Kh[...]
 //
-// Fix: pad Ks/Vs to Ks[Bc][64+PAD] so stride is 65 (coprime to 32).
-//   Address = tid*65 + i, bank = (tid*65 + i) % 32 = (tid + i) % 32
-//   → For fixed i, each thread hits a different bank → conflict-free writes.
+// Benefits:
+//   1. 4x faster loading (128 threads vs 32)
+//   2. Naturally coalesced: consecutive threads access consecutive addresses
+//   3. Naturally bank-conflict-free for writes: consecutive threads write
+//      consecutive shared memory addresses → each thread hits a different bank
+//      (bank = idx % 32, and consecutive tids have consecutive idx values)
 //
-// Also: cooperative loading spreads the 2048 K/V values across all Br=128 threads
-//   (instead of only first 32), reducing per-thread load work and improving balance.
+// Note: Previous K3 used PAD=1 (stride 65) to avoid bank conflicts. However,
+// cooperative linear-index loading already avoids write conflicts without padding.
+// Removing the pad saves ~1KB shared memory, enabling 3 blocks/SM instead of 2.
 //
-// Read pattern is unchanged: all threads read Ks[j][i] → broadcast → no conflict.
+// Occupancy analysis (P100, sm_60):
+//   Registers: Qi[64]+Oi[64]+ss[32]+misc ≈ 170/thread
+//   Shared: Ks[32][64]+Vs[32][64] = 16KB (no padding needed!)
+//   __launch_bounds__(128,3) → compiler targets ≤170 regs
+//   3×128 = 384 threads/SM = 12 warps = 18.75% occupancy
+//   (vs old K3 with padding: 16.6KB → 2 blocks → 12.5%)
 //
 // grid = (Tr, bh), blockDim = Br = 128
 
-__global__ void flash_attention_v3_kernel(
+__global__ __launch_bounds__(128, 3)
+void flash_attention_v3_kernel(
     const float* Q, const float* K, const float* V,
     float* O,
     int bh, int N, int d)
@@ -45,9 +54,9 @@ __global__ void flash_attention_v3_kernel(
     float mi = -1e9f;
     float li = 0.0f;
 
-    // Padded layout: stride = 64+PAD = 65 (coprime to 32) → conflict-free writes
-    __shared__ float Ks[Bc][64 + PAD];
-    __shared__ float Vs[Bc][64 + PAD];
+    // No padding: cooperative loading is naturally bank-conflict-free
+    __shared__ float Ks[Bc][64];
+    __shared__ float Vs[Bc][64];
 
     float Qi[64];
     float Oi[64] = {0.0f};
@@ -66,7 +75,8 @@ __global__ void flash_attention_v3_kernel(
     for (int kv_tile = 0; kv_tile < Tc; kv_tile++) {
         // Cooperative load: all Br=128 threads share the work of loading
         // Bc*d = 32*64 = 2048 values → 16 values per thread
-        // Coalesced: consecutive threads read consecutive global addresses
+        // Linear indexing: thread tid loads elements tid, tid+128, tid+256, ...
+        // → consecutive threads access consecutive addresses → coalesced + no bank conflict
         int tile_base = kv_tile * Bc;
         for (int idx = tid; idx < Bc * d; idx += Br) {
             int r = idx / d;
@@ -74,7 +84,7 @@ __global__ void flash_attention_v3_kernel(
             int kv_row = tile_base + r;
             float kval = (kv_row < N) ? Kh[kv_row * d + c] : 0.0f;
             float vval = (kv_row < N) ? Vh[kv_row * d + c] : 0.0f;
-            Ks[r][c] = kval;   // bank = (r*65 + c) % 32, varies with tid → no conflict
+            Ks[r][c] = kval;
             Vs[r][c] = vval;
         }
         __syncthreads();
